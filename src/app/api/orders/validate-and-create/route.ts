@@ -2,31 +2,31 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabaseServer";
 import { createClient } from "@supabase/supabase-js";
 
-function getUserClientFromAuthHeader(req: Request) {
-  // Next app router: vamos pegar o token do supabase via cookie/session do client?
-  // MVP simples: receber o access_token no header Authorization (Bearer)
-  // Mas no nosso checkout atual, não enviamos token.
-  // Então faremos: usar cookies do supabase via supabase/auth-helpers depois.
-  // Por enquanto: vamos bloquear sem token.
-  return null;
-}
-
 export async function POST(req: Request) {
   try {
     const body = await req.json();
 
     const { cep, rua, numero, complemento, cidade, dia_semana, items } = body || {};
-    if (!cep || !rua || !numero || !cidade || !dia_semana || !Array.isArray(items) || items.length === 0) {
+    if (
+      !cep ||
+      !rua ||
+      !numero ||
+      !cidade ||
+      !dia_semana ||
+      !Array.isArray(items) ||
+      items.length === 0
+    ) {
       return NextResponse.json({ error: "Dados inválidos." }, { status: 400 });
     }
 
-    // IMPORTANTE (MVP): como estamos server-side, precisamos identificar o usuário.
-    // Solução correta: usar @supabase/auth-helpers-nextjs.
-    // Para não te travar, faremos um modo simples: exigir Authorization: Bearer <access_token>.
+    // MVP: exige Authorization Bearer <access_token>
     const auth = req.headers.get("authorization") || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     if (!token) {
-      return NextResponse.json({ error: "Não autenticado (faltou Authorization Bearer token)." }, { status: 401 });
+      return NextResponse.json(
+        { error: "Não autenticado (faltou Authorization Bearer token)." },
+        { status: 401 }
+      );
     }
 
     const supaUser = createClient(
@@ -41,14 +41,22 @@ export async function POST(req: Request) {
     }
     const user_id = userData.user.id;
 
+    // normaliza items (garante numero)
+    const normItems = items.map((i: any) => ({
+      product_id: Number(i.product_id),
+      quantidade: Number(i.quantidade),
+    }));
+
+    // ids únicos (importante pra capacidade/produtos)
+    const productIdsUnique = Array.from(new Set(normItems.map((i) => i.product_id)));
+
     // 1) Carregar produtos e preços
-    const productIds = items.map((i: any) => Number(i.product_id));
     const { data: prods, error: prodErr } = await supabaseAdmin
       .from("products")
       .select("id,nome,preco,ativo")
-      .in("id", productIds);
+      .in("id", productIdsUnique);
 
-    if (prodErr || !prods || prods.length !== productIds.length) {
+    if (prodErr || !prods || prods.length !== productIdsUnique.length) {
       return NextResponse.json({ error: "Produtos inválidos." }, { status: 400 });
     }
     if (prods.some((p: any) => !p.ativo)) {
@@ -56,64 +64,111 @@ export async function POST(req: Request) {
     }
 
     // 2) Buscar frete
-    const { data: settingFrete } = await supabaseAdmin.from("settings").select("value").eq("key", "frete_valor").single();
+    const { data: settingFrete } = await supabaseAdmin
+      .from("settings")
+      .select("value")
+      .eq("key", "frete_valor")
+      .single();
+
     const frete = Number(settingFrete?.value ?? "7.00");
 
-    // 3) Validar capacidade: soma pedidos PAGOS por dia_semana + produto
-    //    (capacidade do dia da semana)
+    // 3) Capacidade do dia por produto
     const { data: caps, error: capErr } = await supabaseAdmin
       .from("daily_capacity")
       .select("product_id,limite_total")
       .eq("dia_semana", Number(dia_semana))
-      .in("product_id", productIds);
+      .in("product_id", productIdsUnique);
 
-    if (capErr) return NextResponse.json({ error: "Erro ao consultar capacidade." }, { status: 500 });
-
-    // precisa ter capacidade cadastrada para todos do carrinho
-    if (!caps || caps.length !== productIds.length) {
-      return NextResponse.json({ error: "Capacidade não configurada para algum produto nesse dia." }, { status: 400 });
+    if (capErr) {
+      return NextResponse.json({ error: "Erro ao consultar capacidade." }, { status: 500 });
     }
 
-    // soma quantidades já vendidas (PAGO)
+    // monta mapa de capacidade (product_id -> limite_total)
+    const capByProduct = new Map<number, number>();
+    for (const c of caps || []) {
+      capByProduct.set(Number(c.product_id), Number(c.limite_total));
+    }
+
+    // se faltar capacidade pra algum produto
+    for (const pid of productIdsUnique) {
+      if (!capByProduct.has(pid)) {
+        return NextResponse.json(
+          { error: "Capacidade não configurada para algum produto nesse dia." },
+          { status: 400 }
+        );
+      }
+    }
+
+    // soma quantidades já vendidas (PAGO) no mesmo dia_semana
     const { data: soldRows, error: soldErr } = await supabaseAdmin
       .from("orders")
       .select("id")
       .eq("status", "PAGO")
       .eq("dia_semana", Number(dia_semana));
 
-    if (soldErr) return NextResponse.json({ error: "Erro ao consultar pedidos pagos." }, { status: 500 });
+    if (soldErr) {
+      return NextResponse.json({ error: "Erro ao consultar pedidos pagos." }, { status: 500 });
+    }
 
-    let soldByProduct: Record<number, number> = {};
+    const soldByProduct: Record<number, number> = {};
     if (soldRows && soldRows.length > 0) {
       const orderIds = soldRows.map((o: any) => o.id);
+
       const { data: soldItems, error: soldItemsErr } = await supabaseAdmin
         .from("order_items")
         .select("product_id,quantidade")
         .in("order_id", orderIds);
 
-      if (soldItemsErr) return NextResponse.json({ error: "Erro ao consultar itens vendidos." }, { status: 500 });
+      if (soldItemsErr) {
+        return NextResponse.json({ error: "Erro ao consultar itens vendidos." }, { status: 500 });
+      }
 
       for (const it of soldItems || []) {
-        soldByProduct[it.product_id] = (soldByProduct[it.product_id] || 0) + Number(it.quantidade);
+        const pid = Number(it.product_id);
+        soldByProduct[pid] = (soldByProduct[pid] || 0) + Number(it.quantidade);
       }
     }
 
     // valida cada item
-    for (const it of items) {
-      const pid = Number(it.product_id);
-      const qtd = Number(it.quantidade);
-      const cap = caps.find((c: any) => c.product_id === pid);
+    for (const it of normItems) {
+      const pid = it.product_id;
+      const qtd = it.quantidade;
+
+      if (!Number.isFinite(pid) || pid <= 0 || !Number.isFinite(qtd) || qtd <= 0) {
+        return NextResponse.json({ error: "Item inválido no carrinho." }, { status: 400 });
+      }
+
+      const limite = capByProduct.get(pid);
+      if (limite === undefined) {
+        // TS resolvido + segurança
+        return NextResponse.json(
+          { error: `Capacidade não configurada para produto ${pid} nesse dia.` },
+          { status: 400 }
+        );
+      }
+
       const ja = soldByProduct[pid] || 0;
-      if (ja + qtd > Number(cap.limite_total)) {
-        return NextResponse.json({
-          error: `Limite excedido para produto ${pid} nesse dia. Restante: ${Math.max(0, Number(cap.limite_total) - ja)}`
-        }, { status: 409 });
+      if (ja + qtd > limite) {
+        return NextResponse.json(
+          {
+            error: `Limite excedido para produto ${pid} nesse dia. Restante: ${Math.max(
+              0,
+              limite - ja
+            )}`,
+          },
+          { status: 409 }
+        );
       }
     }
 
     // 4) Calcular subtotal/total
-    const priceById = new Map(prods.map((p: any) => [p.id, Number(p.preco)]));
-    const subtotal = items.reduce((acc: number, it: any) => acc + priceById.get(Number(it.product_id))! * Number(it.quantidade), 0);
+    const priceById = new Map<number, number>(prods.map((p: any) => [Number(p.id), Number(p.preco)]));
+    const subtotal = normItems.reduce((acc: number, it) => {
+      const price = priceById.get(it.product_id);
+      if (price === undefined) return acc; // segurança
+      return acc + price * it.quantidade;
+    }, 0);
+
     const total = subtotal + frete;
 
     // 5) Criar order + itens (PENDENTE)
@@ -123,31 +178,37 @@ export async function POST(req: Request) {
         user_id,
         cidade,
         dia_semana: Number(dia_semana),
-        cep, rua, numero,
+        cep,
+        rua,
+        numero,
         complemento: complemento || "",
-        subtotal, frete, total,
-        status: "PENDENTE"
+        subtotal,
+        frete,
+        total,
+        status: "PENDENTE",
       })
       .select("id")
       .single();
 
-    if (orderErr || !order) return NextResponse.json({ error: "Erro ao criar pedido." }, { status: 500 });
+    if (orderErr || !order) {
+      return NextResponse.json({ error: "Erro ao criar pedido." }, { status: 500 });
+    }
 
-    const orderItems = items.map((it: any) => {
-      const pid = Number(it.product_id);
-      const qtd = Number(it.quantidade);
-      const preco_unit = priceById.get(pid)!;
+    const orderItems = normItems.map((it) => {
+      const preco_unit = priceById.get(it.product_id) || 0;
       return {
         order_id: order.id,
-        product_id: pid,
-        quantidade: qtd,
+        product_id: it.product_id,
+        quantidade: it.quantidade,
         preco_unit,
-        subtotal: preco_unit * qtd
+        subtotal: preco_unit * it.quantidade,
       };
     });
 
     const { error: itemsErr } = await supabaseAdmin.from("order_items").insert(orderItems);
-    if (itemsErr) return NextResponse.json({ error: "Erro ao salvar itens." }, { status: 500 });
+    if (itemsErr) {
+      return NextResponse.json({ error: "Erro ao salvar itens." }, { status: 500 });
+    }
 
     return NextResponse.json({ order_id: order.id }, { status: 200 });
   } catch {

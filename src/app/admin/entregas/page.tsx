@@ -6,6 +6,11 @@ import { supabase } from "@/lib/supabaseClient";
 type PaymentStatus = "PENDENTE" | "PAGO" | "CANCELADO";
 type DeliveryStatus = "NOVO" | "EM_ROTA" | "ENTREGUE" | "FALHOU";
 
+type ProductMini = { nome: string; image_url: string | null };
+
+// ✅ aqui é o ponto: pode vir objeto OU array (dependendo do relacionamento no Supabase)
+type ProductMaybeArray = ProductMini | ProductMini[] | null;
+
 type OrderRow = {
   id: string;
   cidade: string;
@@ -30,7 +35,7 @@ type OrderRow = {
     quantidade: number;
     preco_unit: number;
     subtotal: number;
-    products?: { nome: string; image_url: string | null } | null;
+    products?: ProductMaybeArray;
   }>;
 };
 
@@ -67,6 +72,13 @@ function badgePay(ps: PaymentStatus) {
   if (ps === "PAGO") return "border-emerald-500/20 bg-emerald-500/10 text-emerald-200";
   if (ps === "PENDENTE") return "border-amber-500/20 bg-amber-500/10 text-amber-200";
   return "border-zinc-500/20 bg-zinc-500/10 text-zinc-200";
+}
+
+// ✅ normaliza product (se vier array, pega o primeiro)
+function firstProduct(p: ProductMaybeArray): ProductMini | null {
+  if (!p) return null;
+  if (Array.isArray(p)) return p[0] ?? null;
+  return p;
 }
 
 export default function AdminEntregasPage() {
@@ -119,7 +131,8 @@ export default function AdminEntregasPage() {
       return;
     }
 
-    setOrders((data || []) as OrderRow[]);
+    // ✅ aqui resolve o erro do build: converte via unknown
+    setOrders((data || []) as unknown as OrderRow[]);
     setLoading(false);
   }
 
@@ -213,7 +226,6 @@ export default function AdminEntregasPage() {
 
       setMsg({ type: "ok", text: `Entrega atualizada para ${next} ✅` });
 
-      // atualiza local
       setOrders((prev) =>
         prev.map((o) =>
           o.id === orderId
@@ -227,7 +239,6 @@ export default function AdminEntregasPage() {
         )
       );
 
-      // atualiza selected
       setSelected((cur) =>
         cur && cur.id === orderId
           ? {
@@ -489,7 +500,6 @@ export default function AdminEntregasPage() {
                       Clique para abrir e marcar entrega
                     </div>
 
-                    {/* bloco print */}
                     <div className="mt-4 hidden print:block">
                       <div className="h-10 rounded border border-zinc-300" />
                       <div className="mt-1 text-xs text-zinc-600">Assinatura / confirmação</div>
@@ -545,33 +555,37 @@ export default function AdminEntregasPage() {
                       Nenhum item encontrado nesse pedido.
                     </div>
                   ) : (
-                    selected.order_items?.map((it) => (
-                      <div key={it.id} className="flex items-center gap-4 rounded-2xl border border-white/10 bg-white/5 p-4">
-                        <div className="h-12 w-16 shrink-0 overflow-hidden rounded-xl border border-white/10 bg-zinc-950/40">
-                          {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img
-                            src={it.products?.image_url || "https://placehold.co/480x320?text=Produto"}
-                            alt={it.products?.nome || "Produto"}
-                            className="h-full w-full object-cover"
-                            loading="lazy"
-                          />
-                        </div>
+                    selected.order_items?.map((it) => {
+                      const p = firstProduct(it.products ?? null);
+                      const img = p?.image_url || "https://placehold.co/480x320?text=Produto";
+                      const name = p?.nome || `Produto #${it.product_id}`;
 
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm font-semibold">
-                            {it.products?.nome || `Produto #${it.product_id}`}
+                      return (
+                        <div key={it.id} className="flex items-center gap-4 rounded-2xl border border-white/10 bg-white/5 p-4">
+                          <div className="h-12 w-16 shrink-0 overflow-hidden rounded-xl border border-white/10 bg-zinc-950/40">
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                              src={img}
+                              alt={name}
+                              className="h-full w-full object-cover"
+                              loading="lazy"
+                            />
                           </div>
-                          <div className="mt-1 text-xs text-zinc-400">
-                            {it.quantidade}x • {formatBRL(Number(it.preco_unit))}
-                          </div>
-                        </div>
 
-                        <div className="text-right">
-                          <div className="text-xs text-zinc-400">Subtotal</div>
-                          <div className="text-sm font-semibold">{formatBRL(Number(it.subtotal))}</div>
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-semibold">{name}</div>
+                            <div className="mt-1 text-xs text-zinc-400">
+                              {it.quantidade}x • {formatBRL(Number(it.preco_unit))}
+                            </div>
+                          </div>
+
+                          <div className="text-right">
+                            <div className="text-xs text-zinc-400">Subtotal</div>
+                            <div className="text-sm font-semibold">{formatBRL(Number(it.subtotal))}</div>
+                          </div>
                         </div>
-                      </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
 
@@ -673,7 +687,6 @@ export default function AdminEntregasPage() {
         </div>
       )}
 
-      {/* CSS print */}
       <style jsx global>{`
         @media print {
           body {

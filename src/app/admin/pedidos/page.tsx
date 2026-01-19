@@ -5,6 +5,9 @@ import { supabase } from "@/lib/supabaseClient";
 
 type OrderStatus = "PENDENTE" | "PAGO" | "CANCELADO";
 
+type ProductMini = { nome: string; image_url: string | null };
+type ProductMaybeArray = ProductMini | ProductMini[] | null;
+
 type OrderRow = {
   id: string;
   user_id: string;
@@ -26,7 +29,7 @@ type OrderRow = {
     quantidade: number;
     preco_unit: number;
     subtotal: number;
-    products?: { nome: string; image_url: string | null } | null;
+    products?: ProductMaybeArray; // ✅ aqui
   }>;
 };
 
@@ -48,6 +51,12 @@ function badgeClasses(status: OrderStatus) {
   if (status === "PAGO") return "border-emerald-500/20 bg-emerald-500/10 text-emerald-200";
   if (status === "PENDENTE") return "border-amber-500/20 bg-amber-500/10 text-amber-200";
   return "border-zinc-500/20 bg-zinc-500/10 text-zinc-200";
+}
+
+function firstProduct(p: ProductMaybeArray): ProductMini | null {
+  if (!p) return null;
+  if (Array.isArray(p)) return p[0] ?? null;
+  return p;
 }
 
 export default function AdminPedidosPage() {
@@ -117,7 +126,8 @@ export default function AdminPedidosPage() {
       return;
     }
 
-    setOrders((data || []) as OrderRow[]);
+    // ✅ TS safe no build
+    setOrders((data || []) as unknown as OrderRow[]);
     setLoading(false);
   }
 
@@ -162,14 +172,11 @@ export default function AdminPedidosPage() {
 
   return (
     <div className="space-y-5">
-      {/* topo da página (SEM MENU) */}
       <div className="rounded-3xl border border-white/10 bg-white/5 p-6">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Pedidos</h1>
-            <p className="mt-1 text-sm text-zinc-400">
-              Veja pedidos, abra detalhes e acompanhe o status.
-            </p>
+            <p className="mt-1 text-sm text-zinc-400">Veja pedidos, abra detalhes e acompanhe o status.</p>
 
             <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
               <div className="rounded-2xl border border-white/10 bg-zinc-950/20 p-3">
@@ -191,7 +198,6 @@ export default function AdminPedidosPage() {
             </div>
           </div>
 
-          {/* filtros */}
           <div className="grid w-full gap-2 sm:grid-cols-3 lg:w-[560px]">
             <div className="sm:col-span-3">
               <label className="text-xs text-zinc-400">Buscar (cidade, id, CEP)</label>
@@ -270,7 +276,6 @@ export default function AdminPedidosPage() {
         )}
       </div>
 
-      {/* lista */}
       {loading ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {Array.from({ length: 9 }).map((_, i) => (
@@ -326,7 +331,6 @@ export default function AdminPedidosPage() {
         </div>
       )}
 
-      {/* modal */}
       {open && selected && (
         <div className="fixed inset-0 z-[999] flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={closeDetails} />
@@ -355,7 +359,6 @@ export default function AdminPedidosPage() {
             </div>
 
             <div className="grid grid-cols-1 gap-6 p-6 lg:grid-cols-[1fr_320px]">
-              {/* itens */}
               <div>
                 <h3 className="text-lg font-semibold">Itens</h3>
                 <p className="mt-1 text-sm text-zinc-400">Produtos e quantidades.</p>
@@ -366,41 +369,39 @@ export default function AdminPedidosPage() {
                       Nenhum item encontrado nesse pedido.
                     </div>
                   ) : (
-                    selected.order_items?.map((it) => (
-                      <div
-                        key={it.id}
-                        className="flex items-center gap-4 rounded-2xl border border-white/10 bg-white/5 p-4"
-                      >
-                        <div className="h-12 w-16 shrink-0 overflow-hidden rounded-xl border border-white/10 bg-zinc-950/40">
-                          {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img
-                            src={it.products?.image_url || "https://placehold.co/480x320?text=Produto"}
-                            alt={it.products?.nome || "Produto"}
-                            className="h-full w-full object-cover"
-                            loading="lazy"
-                          />
-                        </div>
+                    selected.order_items?.map((it) => {
+                      const p = firstProduct(it.products ?? null);
+                      const img = p?.image_url || "https://placehold.co/480x320?text=Produto";
+                      const name = p?.nome || `Produto #${it.product_id}`;
 
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm font-semibold">
-                            {it.products?.nome || `Produto #${it.product_id}`}
+                      return (
+                        <div
+                          key={it.id}
+                          className="flex items-center gap-4 rounded-2xl border border-white/10 bg-white/5 p-4"
+                        >
+                          <div className="h-12 w-16 shrink-0 overflow-hidden rounded-xl border border-white/10 bg-zinc-950/40">
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img src={img} alt={name} className="h-full w-full object-cover" loading="lazy" />
                           </div>
-                          <div className="mt-1 text-xs text-zinc-400">
-                            {it.quantidade}x • {formatBRL(Number(it.preco_unit))}
-                          </div>
-                        </div>
 
-                        <div className="text-right">
-                          <div className="text-xs text-zinc-400">Subtotal</div>
-                          <div className="text-sm font-semibold">{formatBRL(Number(it.subtotal))}</div>
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-semibold">{name}</div>
+                            <div className="mt-1 text-xs text-zinc-400">
+                              {it.quantidade}x • {formatBRL(Number(it.preco_unit))}
+                            </div>
+                          </div>
+
+                          <div className="text-right">
+                            <div className="text-xs text-zinc-400">Subtotal</div>
+                            <div className="text-sm font-semibold">{formatBRL(Number(it.subtotal))}</div>
+                          </div>
                         </div>
-                      </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
               </div>
 
-              {/* resumo/endereço */}
               <div className="h-fit rounded-3xl border border-white/10 bg-white/5 p-5">
                 <h3 className="text-lg font-semibold">Resumo</h3>
 
@@ -430,9 +431,7 @@ export default function AdminPedidosPage() {
                       {selected.rua}, {selected.numero}
                     </div>
 
-                    {selected.complemento ? (
-                      <div className="mt-1 text-zinc-300">{selected.complemento}</div>
-                    ) : null}
+                    {selected.complemento ? <div className="mt-1 text-zinc-300">{selected.complemento}</div> : null}
 
                     <div className="mt-2 text-xs text-zinc-400">
                       CEP: {selected.cep} • Cidade: {selected.cidade}

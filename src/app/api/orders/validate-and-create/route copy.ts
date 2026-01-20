@@ -2,21 +2,24 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabaseServer";
 import { createClient } from "@supabase/supabase-js";
 
-export const runtime = "nodejs";
-
 export async function POST(req: Request) {
   try {
     const body = await req.json();
 
     const { cep, rua, numero, complemento, cidade, dia_semana, items } = body || {};
     if (
-      !cep || !rua || !numero || !cidade || !dia_semana ||
-      !Array.isArray(items) || items.length === 0
+      !cep ||
+      !rua ||
+      !numero ||
+      !cidade ||
+      !dia_semana ||
+      !Array.isArray(items) ||
+      items.length === 0
     ) {
       return NextResponse.json({ error: "Dados inválidos." }, { status: 400 });
     }
 
-    // exige Authorization Bearer <access_token>
+    // MVP: exige Authorization Bearer <access_token>
     const auth = req.headers.get("authorization") || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     if (!token) {
@@ -26,7 +29,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // valida sessão do usuário via anon key
     const supaUser = createClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
@@ -39,18 +41,17 @@ export async function POST(req: Request) {
     }
     const user_id = userData.user.id;
 
-    const admin = supabaseAdmin();
-
-    // normaliza items
+    // normaliza items (garante numero)
     const normItems = items.map((i: any) => ({
       product_id: Number(i.product_id),
       quantidade: Number(i.quantidade),
     }));
 
+    // ids únicos (importante pra capacidade/produtos)
     const productIdsUnique = Array.from(new Set(normItems.map((i) => i.product_id)));
 
-    // 1) Carregar produtos
-    const { data: prods, error: prodErr } = await admin
+    // 1) Carregar produtos e preços
+    const { data: prods, error: prodErr } = await supabaseAdmin
       .from("products")
       .select("id,nome,preco,ativo")
       .in("id", productIdsUnique);
@@ -62,8 +63,8 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Há produto inativo no carrinho." }, { status: 400 });
     }
 
-    // 2) Frete
-    const { data: settingFrete } = await admin
+    // 2) Buscar frete
+    const { data: settingFrete } = await supabaseAdmin
       .from("settings")
       .select("value")
       .eq("key", "frete_valor")
@@ -71,46 +72,56 @@ export async function POST(req: Request) {
 
     const frete = Number(settingFrete?.value ?? "7.00");
 
-    // 3) Capacidade
-    const { data: caps, error: capErr } = await admin
+    // 3) Capacidade do dia por produto
+    const { data: caps, error: capErr } = await supabaseAdmin
       .from("daily_capacity")
       .select("product_id,limite_total")
       .eq("dia_semana", Number(dia_semana))
       .in("product_id", productIdsUnique);
 
-    if (capErr) return NextResponse.json({ error: "Erro ao consultar capacidade." }, { status: 500 });
+    if (capErr) {
+      return NextResponse.json({ error: "Erro ao consultar capacidade." }, { status: 500 });
+    }
 
+    // monta mapa de capacidade (product_id -> limite_total)
     const capByProduct = new Map<number, number>();
-    for (const c of caps || []) capByProduct.set(Number(c.product_id), Number(c.limite_total));
+    for (const c of caps || []) {
+      capByProduct.set(Number(c.product_id), Number(c.limite_total));
+    }
 
+    // se faltar capacidade pra algum produto
     for (const pid of productIdsUnique) {
       if (!capByProduct.has(pid)) {
         return NextResponse.json(
-          { error: `Capacidade não configurada para produto ${pid} nesse dia.` },
+          { error: "Capacidade não configurada para algum produto nesse dia." },
           { status: 400 }
         );
       }
     }
 
-    // 4) Somar vendidos (PAGO)
-    const { data: soldRows, error: soldErr } = await admin
+    // soma quantidades já vendidas (PAGO) no mesmo dia_semana
+    const { data: soldRows, error: soldErr } = await supabaseAdmin
       .from("orders")
       .select("id")
       .eq("status", "PAGO")
       .eq("dia_semana", Number(dia_semana));
 
-    if (soldErr) return NextResponse.json({ error: "Erro ao consultar pedidos pagos." }, { status: 500 });
+    if (soldErr) {
+      return NextResponse.json({ error: "Erro ao consultar pedidos pagos." }, { status: 500 });
+    }
 
     const soldByProduct: Record<number, number> = {};
-    if (soldRows?.length) {
+    if (soldRows && soldRows.length > 0) {
       const orderIds = soldRows.map((o: any) => o.id);
 
-      const { data: soldItems, error: soldItemsErr } = await admin
+      const { data: soldItems, error: soldItemsErr } = await supabaseAdmin
         .from("order_items")
         .select("product_id,quantidade")
         .in("order_id", orderIds);
 
-      if (soldItemsErr) return NextResponse.json({ error: "Erro ao consultar itens vendidos." }, { status: 500 });
+      if (soldItemsErr) {
+        return NextResponse.json({ error: "Erro ao consultar itens vendidos." }, { status: 500 });
+      }
 
       for (const it of soldItems || []) {
         const pid = Number(it.product_id);
@@ -127,40 +138,62 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: "Item inválido no carrinho." }, { status: 400 });
       }
 
-      const limite = capByProduct.get(pid)!;
-      const ja = soldByProduct[pid] || 0;
+      const limite = capByProduct.get(pid);
+      if (limite === undefined) {
+        // TS resolvido + segurança
+        return NextResponse.json(
+          { error: `Capacidade não configurada para produto ${pid} nesse dia.` },
+          { status: 400 }
+        );
+      }
 
+      const ja = soldByProduct[pid] || 0;
       if (ja + qtd > limite) {
         return NextResponse.json(
-          { error: `Limite excedido p/ produto ${pid}. Restante: ${Math.max(0, limite - ja)}` },
+          {
+            error: `Limite excedido para produto ${pid} nesse dia. Restante: ${Math.max(
+              0,
+              limite - ja
+            )}`,
+          },
           { status: 409 }
         );
       }
     }
 
-    // 5) Calcular subtotal/total
+    // 4) Calcular subtotal/total
     const priceById = new Map<number, number>(prods.map((p: any) => [Number(p.id), Number(p.preco)]));
-    const subtotal = normItems.reduce((acc, it) => acc + (priceById.get(it.product_id) || 0) * it.quantidade, 0);
+    const subtotal = normItems.reduce((acc: number, it) => {
+      const price = priceById.get(it.product_id);
+      if (price === undefined) return acc; // segurança
+      return acc + price * it.quantidade;
+    }, 0);
+
     const total = subtotal + frete;
 
-    // 6) Criar pedido PENDENTE
-    const { data: order, error: orderErr } = await admin
+    // 5) Criar order + itens (PENDENTE)
+    const { data: order, error: orderErr } = await supabaseAdmin
       .from("orders")
       .insert({
         user_id,
         cidade,
         dia_semana: Number(dia_semana),
-        cep, rua, numero,
+        cep,
+        rua,
+        numero,
         complemento: complemento || "",
-        subtotal, frete, total,
+        subtotal,
+        frete,
+        total,
         status: "PENDENTE",
       })
       .select("id")
       .single();
 
-    if (orderErr || !order) return NextResponse.json({ error: "Erro ao criar pedido." }, { status: 500 });
+    if (orderErr || !order) {
+      return NextResponse.json({ error: "Erro ao criar pedido." }, { status: 500 });
+    }
 
-    // 7) Criar itens
     const orderItems = normItems.map((it) => {
       const preco_unit = priceById.get(it.product_id) || 0;
       return {
@@ -172,11 +205,13 @@ export async function POST(req: Request) {
       };
     });
 
-    const { error: itemsErr } = await admin.from("order_items").insert(orderItems);
-    if (itemsErr) return NextResponse.json({ error: "Erro ao salvar itens." }, { status: 500 });
+    const { error: itemsErr } = await supabaseAdmin.from("order_items").insert(orderItems);
+    if (itemsErr) {
+      return NextResponse.json({ error: "Erro ao salvar itens." }, { status: 500 });
+    }
 
-    return NextResponse.json({ order_id: order.id, frete, subtotal, total }, { status: 200 });
-  } catch (e: any) {
-    return NextResponse.json({ error: e?.message || "Erro inesperado." }, { status: 500 });
+    return NextResponse.json({ order_id: order.id }, { status: 200 });
+  } catch {
+    return NextResponse.json({ error: "Erro inesperado." }, { status: 500 });
   }
 }

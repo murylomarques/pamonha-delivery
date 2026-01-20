@@ -7,7 +7,8 @@ function requireEnv(name: string) {
   return v;
 }
 
-export function supabaseAdmin() {
+// Cria sob demanda (não estoura no import)
+export function getSupabaseAdmin() {
   const url = requireEnv("NEXT_PUBLIC_SUPABASE_URL");
   const serviceKey = requireEnv("SUPABASE_SERVICE_ROLE_KEY");
 

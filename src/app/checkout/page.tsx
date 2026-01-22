@@ -19,6 +19,17 @@ function normalizeCity(s: string) {
   return String(s || "").trim().replace(/\s+/g, " ");
 }
 
+/** parse seguro pra evitar crashes em alguns browsers */
+async function safeJson(res: Response) {
+  const txt = await res.text();
+  if (!txt) return {};
+  try {
+    return JSON.parse(txt);
+  } catch {
+    return { raw: txt };
+  }
+}
+
 export default function CheckoutPage() {
   const [items, setItems] = useState<CartItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -35,18 +46,22 @@ export default function CheckoutPage() {
   const [cidade, setCidade] = useState("");
   const [diaSemana, setDiaSemana] = useState<number>(1);
 
-  // dados do roteiro
+  // roteiro
   const [cidadesDisponiveis, setCidadesDisponiveis] = useState<string[]>([]);
   const [diasDisponiveis, setDiasDisponiveis] = useState<number[]>([]);
 
   const [msg, setMsg] = useState<{ type: "error" | "ok"; text: string } | null>(null);
 
-  // frete: por enquanto fixo (depois a gente puxa do settings)
+  // frete (mantive o seu fixo)
   const FRETE_FIXO = 1;
 
   useEffect(() => {
-    const raw = localStorage.getItem("cart");
-    setItems(raw ? JSON.parse(raw) : []);
+    try {
+      const raw = localStorage.getItem("cart");
+      setItems(raw ? JSON.parse(raw) : []);
+    } catch {
+      setItems([]);
+    }
   }, []);
 
   const subtotal = useMemo(
@@ -57,7 +72,7 @@ export default function CheckoutPage() {
   const frete = useMemo(() => (items.length ? FRETE_FIXO : 0), [items.length]);
   const total = useMemo(() => subtotal + frete, [subtotal, frete]);
 
-  // carrega roteiro (cidades/dias)
+  // carrega cidades/dias e perfil
   useEffect(() => {
     (async () => {
       setLoading(true);
@@ -80,7 +95,6 @@ export default function CheckoutPage() {
       if (profile?.nome) setNome(profile.nome);
       if (profile?.telefone) setTelefone(profile.telefone);
 
-      // rota: cidades disponíveis
       const { data: routes, error } = await supabase
         .from("route_days")
         .select("cidade,dia_semana,ativo")
@@ -101,7 +115,6 @@ export default function CheckoutPage() {
       const cities = Array.from(setCities).sort((a, b) => a.localeCompare(b, "pt-BR"));
       setCidadesDisponiveis(cities);
 
-      // escolhe cidade default
       const firstCity = cities[0] || "";
       setCidade((cur) => cur || firstCity);
 
@@ -131,10 +144,9 @@ export default function CheckoutPage() {
 
       setDiasDisponiveis(days);
 
-      // se o dia atual não existir mais, seta o primeiro disponível
       if (days.length && !days.includes(diaSemana)) setDiaSemana(days[0]);
     })();
-  }, [cidade]);
+  }, [cidade, diaSemana]);
 
   async function lookupCep() {
     setMsg(null);
@@ -146,7 +158,6 @@ export default function CheckoutPage() {
     }
 
     try {
-      // ViaCEP (público)
       const r = await fetch(`https://viacep.com.br/ws/${c}/json/`);
       const j = await r.json();
 
@@ -156,10 +167,6 @@ export default function CheckoutPage() {
       }
 
       setRua(j.logradouro || "");
-      // ViaCEP pode retornar cidade diferente do seu roteiro. Você pode escolher:
-      // - travar na cidade do roteiro, ou
-      // - sugerir a cidade do ViaCEP.
-      // Aqui a gente só mostra e deixa você escolher.
       setMsg({ type: "ok", text: `CEP ok: ${j.localidade} - ${j.uf}` });
     } catch {
       setMsg({ type: "error", text: "Falha ao consultar CEP (ViaCEP)." });
@@ -180,105 +187,101 @@ export default function CheckoutPage() {
   }
 
   async function submit() {
-  setMsg(null);
-  const err = validate();
-  if (err) return setMsg({ type: "error", text: err });
+    setMsg(null);
+    const err = validate();
+    if (err) return setMsg({ type: "error", text: err });
 
-  if (submitting) return; // evita duplo clique
+    if (submitting) return;
+    setSubmitting(true);
 
-  setSubmitting(true);
-  let createdOrderId: string | null = null;
+    let createdOrderId: string | null = null;
 
-  try {
-    // usuário logado
-    const { data: u } = await supabase.auth.getUser();
-    if (!u.user) {
-      window.location.href = "/login";
-      return;
-    }
+    try {
+      // pega sessão/token
+      const { data: s } = await supabase.auth.getSession();
+      const accessToken = s.session?.access_token;
 
-    // 1) cria pedido
-    const payloadOrder = {
-      user_id: u.user.id,
-      cidade: normalizeCity(cidade),
-      dia_semana: diaSemana,
-      cep: onlyDigits(cep),
-      rua: rua.trim(),
-      numero: numero.trim(),
-      complemento: complemento.trim() || "",
-      subtotal,
-      frete,
-      total,
-      status: "PENDENTE",
-    };
+      if (!accessToken) {
+        window.location.href = "/login";
+        return;
+      }
 
-    const { data: order, error: orderErr } = await supabase
-      .from("orders")
-      .insert(payloadOrder)
-      .select("id")
-      .single();
+      // 1) cria pedido via API server-side (com validação)
+      const createRes = await fetch("/api/orders/validate-and-create", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          cep: onlyDigits(cep),
+          rua: rua.trim(),
+          numero: numero.trim(),
+          complemento: complemento.trim() || "",
+          cidade: normalizeCity(cidade),
+          dia_semana: diaSemana,
+          items: items.map((it) => ({
+            product_id: it.product_id,
+            quantidade: Number(it.qtd || 1),
+          })),
+        }),
+      });
 
-    if (orderErr || !order?.id) throw new Error(orderErr?.message || "Falha ao criar pedido.");
+      const createJson = await safeJson(createRes);
 
-    const orderId = order.id as string;
-    createdOrderId = orderId;
+      if (!createRes.ok) {
+        const detail = createJson?.error || "Erro ao criar pedido.";
+        throw new Error(String(detail));
+      }
 
-    // 2) cria itens
-    const payloadItems = items.map((it) => ({
-      order_id: orderId,
-      product_id: it.product_id,
-      quantidade: Number(it.qtd || 1),
-      preco_unit: Number(it.preco || 0),
-      subtotal: Number(it.preco || 0) * Number(it.qtd || 1),
-    }));
+      const orderId = String(createJson?.order_id || "");
+      if (!orderId) throw new Error("API não retornou order_id.");
 
-    const { error: itemsErr } = await supabase.from("order_items").insert(payloadItems);
-    if (itemsErr) throw new Error(itemsErr.message);
+      createdOrderId = orderId;
 
-    // 3) cria preference no backend (ele busca no banco!)
-    const r = await fetch("/api/mp/preference", {
+      // 2) cria preference do MP
+      const prefRes = await fetch("/api/mp/preference", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-            orderId,
-            frete,
-            items: items.map((it) => ({
+          orderId,
+          frete,
+          items: items.map((it) => ({
             id: it.product_id,
             nome: it.nome,
             preco: Number(it.preco || 0),
             qtd: Number(it.qtd || 1),
-            })),
+          })),
         }),
-    });
+      });
 
+      const prefJson = await safeJson(prefRes);
 
-    const mp = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      // Se o backend devolveu o erro do MP, mostra ele
-      const detail =
-        mp?.mp?.message || mp?.mp?.error || mp?.error || "Erro ao criar pagamento no Mercado Pago.";
-      throw new Error(String(detail));
+      if (!prefRes.ok) {
+        const detail =
+          prefJson?.mp?.message ||
+          prefJson?.mp?.error ||
+          prefJson?.error ||
+          "Erro ao criar pagamento no Mercado Pago.";
+        throw new Error(String(detail));
+      }
+
+      const url = prefJson?.init_point || prefJson?.sandbox_init_point;
+      if (!url) throw new Error("Mercado Pago não retornou a URL de pagamento (init_point).");
+
+      // 3) limpa carrinho e redireciona
+      localStorage.removeItem("cart");
+      window.location.href = String(url);
+    } catch (e: any) {
+      const text = e?.message || "Erro ao finalizar.";
+      setMsg({
+        type: "error",
+        text: createdOrderId ? `${text} (orderId: ${createdOrderId})` : text,
+      });
+    } finally {
+      setSubmitting(false);
     }
-
-    // 4) limpa carrinho só depois que a preference existe
-    localStorage.removeItem("cart");
-
-    // 5) redireciona para MP
-    const url = mp.init_point || mp.sandbox_init_point;
-    if (!url) throw new Error("Mercado Pago não retornou a URL de pagamento (init_point).");
-
-    window.location.href = url;
-  } catch (e: any) {
-    const text = e?.message || "Erro ao finalizar.";
-    setMsg({
-      type: "error",
-      text: createdOrderId ? `${text} (orderId: ${createdOrderId})` : text,
-    });
-  } finally {
-    setSubmitting(false);
   }
-}
-
 
   if (loading) {
     return <div className="min-h-screen bg-zinc-950 text-zinc-100 p-6">Carregando checkout...</div>;

@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 
 type BodyItem = {
-  id: number;       // product_id
+  id: number; // product_id
   nome: string;
   preco: number;
   qtd: number;
@@ -25,8 +25,6 @@ function baseUrl() {
 }
 
 function isPublicHttps(url: string) {
-  // regra simples pra evitar o erro no MP em dev:
-  // só habilita auto_return quando for https e não for localhost/127
   if (!url.startsWith("https://")) return false;
   if (url.includes("localhost")) return false;
   if (url.includes("127.0.0.1")) return false;
@@ -36,6 +34,7 @@ function isPublicHttps(url: string) {
 export async function POST(req: Request) {
   try {
     const MP_ACCESS_TOKEN = requireEnv("MP_ACCESS_TOKEN");
+    const WEBHOOK_SECRET = requireEnv("MP_WEBHOOK_SECRET");
     const siteUrl = baseUrl();
 
     const body = await req.json().catch(() => ({} as any));
@@ -47,7 +46,6 @@ export async function POST(req: Request) {
     if (!orderId) {
       return NextResponse.json({ error: "orderId é obrigatório." }, { status: 400 });
     }
-
     if (!itemsRaw.length) {
       return NextResponse.json({ error: "Sem itens para criar preferência." }, { status: 400 });
     }
@@ -61,7 +59,7 @@ export async function POST(req: Request) {
       currency_id: "BRL",
     }));
 
-    // Se quiser cobrar frete no MP como item separado:
+    // cobra frete como item separado
     if (frete > 0) {
       mpItems.push({
         id: "FRETE",
@@ -78,19 +76,23 @@ export async function POST(req: Request) {
       failure: `${siteUrl}/pagamento/falha?order=${encodeURIComponent(orderId)}`,
     };
 
+    // ✅ webhook com secret na URL
+    const notification_url = `${siteUrl}/api/mp/webhook?secret=${encodeURIComponent(WEBHOOK_SECRET)}`;
+
     const payload: any = {
       items: mpItems,
       back_urls,
       external_reference: String(orderId),
-      // NÃO coloque statement_descriptor por enquanto (pode dar erro dependendo da conta)
+      notification_url, // ✅ ESSENCIAL PRA ATUALIZAR STATUS
     };
 
-    // Só manda auto_return quando a URL for pública e https (evita esse erro em dev)
+    // evita erro em dev e deixa auto-return só quando for https público
     if (isPublicHttps(siteUrl)) {
       payload.auto_return = "approved";
     }
 
     console.log("[MP preference] siteUrl:", siteUrl);
+    console.log("[MP preference] notification_url:", notification_url);
     console.log("[MP preference] payload:", JSON.stringify(payload, null, 2));
 
     const r = await fetch("https://api.mercadopago.com/checkout/preferences", {
@@ -108,10 +110,7 @@ export async function POST(req: Request) {
     console.log("[MP preference] response:", data);
 
     if (!r.ok) {
-      return NextResponse.json(
-        { error: "Mercado Pago recusou a preference", mp: data },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Mercado Pago recusou a preference", mp: data }, { status: 400 });
     }
 
     return NextResponse.json({

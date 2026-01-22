@@ -11,40 +11,23 @@ function requireEnv(name: string) {
 
 export async function POST(req: Request) {
   try {
-    const url = new URL(req.url);
-    const secret = url.searchParams.get("secret");
-
-    const WEBHOOK_SECRET = requireEnv("MP_WEBHOOK_SECRET");
     const MP_ACCESS_TOKEN = requireEnv("MP_ACCESS_TOKEN");
 
-    if (!secret || secret !== WEBHOOK_SECRET) {
-      return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+    const body = await req.json().catch(() => ({} as any));
+    const orderId = String(body?.orderId || "");
+    const paymentId = String(body?.paymentId || "");
+
+    if (!orderId || !paymentId) {
+      return NextResponse.json({ error: "orderId e paymentId são obrigatórios." }, { status: 400 });
     }
 
-    const body = await req.json().catch(() => ({}));
-    const type = body?.type;
-    const paymentId = body?.data?.id;
-
-    // MP costuma mandar: { type: "payment", data: { id: "123" } }
-    if (type !== "payment" || !paymentId) {
-      return NextResponse.json({ ok: true, ignored: true });
-    }
-
-    // Busca pagamento real no MP
     const payRes = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
     });
     const pay = await payRes.json();
-
-    if (!payRes.ok) {
-      return NextResponse.json({ ok: false, error: pay }, { status: 400 });
-    }
+    if (!payRes.ok) return NextResponse.json({ error: pay }, { status: 400 });
 
     const status = String(pay.status || "").toLowerCase();
-    const orderId = String(pay.external_reference || "");
-    if (!orderId) {
-      return NextResponse.json({ ok: true, warning: "sem external_reference" });
-    }
 
     let nextStatus: "PENDENTE" | "PAGO" | "CANCELADO" = "PENDENTE";
     if (status === "approved") nextStatus = "PAGO";
@@ -52,7 +35,6 @@ export async function POST(req: Request) {
     else nextStatus = "PENDENTE";
 
     const admin = supabaseAdmin();
-
     const { error } = await admin
       .from("orders")
       .update({
@@ -62,12 +44,10 @@ export async function POST(req: Request) {
       })
       .eq("id", orderId);
 
-    if (error) {
-      return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
-    }
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
-    return NextResponse.json({ ok: true, orderId, paymentId, status: nextStatus });
+    return NextResponse.json({ ok: true, status: nextStatus });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e?.message || "Erro" }, { status: 500 });
+    return NextResponse.json({ error: e?.message || "Erro inesperado." }, { status: 500 });
   }
 }

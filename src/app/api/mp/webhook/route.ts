@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/supabaseAdmin"; // ou supabaseServer dependendo do seu projeto
+import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
 export const runtime = "nodejs";
 
@@ -9,6 +9,13 @@ function mustEnv(name: string) {
   return v;
 }
 
+// só pra deixar claro a prioridade de status
+const PRIORITY: Record<string, number> = {
+  PENDENTE: 1,
+  CANCELADO: 2,
+  PAGO: 3,
+};
+
 export async function POST(req: Request) {
   try {
     const url = new URL(req.url);
@@ -17,26 +24,27 @@ export async function POST(req: Request) {
     const WEBHOOK_SECRET = mustEnv("MP_WEBHOOK_SECRET");
     const MP_ACCESS_TOKEN = mustEnv("MP_ACCESS_TOKEN");
 
-    console.log("[MP WEBHOOK] hit:", req.url);
-
-    // Proteção simples
     if (!secret || secret !== WEBHOOK_SECRET) {
-      console.log("[MP WEBHOOK] unauthorized. secret recebido:", secret);
+      console.log("[MP WEBHOOK] unauthorized");
       return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
     }
 
     const body = await req.json().catch(() => null);
     console.log("[MP WEBHOOK] body:", JSON.stringify(body));
 
-    const paymentId = body?.data?.id;
-    const type = body?.type;
+    // MP pode mandar o ID em formatos diferentes
+    const paymentId =
+      body?.data?.id ||
+      body?.id ||
+      body?.resource?.split("/")?.pop() ||
+      body?.resource_id;
 
-    if (!paymentId || type !== "payment") {
-      console.log("[MP WEBHOOK] ignored. type:", type, "paymentId:", paymentId);
+    if (!paymentId) {
+      console.log("[MP WEBHOOK] ignored (sem paymentId)");
       return NextResponse.json({ ok: true, ignored: true });
     }
 
-    // Confirma status real no MP
+    // busca o pagamento real no MP
     const payRes = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
     });
@@ -53,20 +61,43 @@ export async function POST(req: Request) {
     const orderId = String(pay.external_reference || "");
 
     if (!orderId) {
-      console.log("[MP WEBHOOK] sem external_reference no pagamento:", paymentId);
+      console.log("[MP WEBHOOK] sem external_reference");
       return NextResponse.json({ ok: true, warning: "sem external_reference" });
     }
 
-    let nextStatus: "PENDENTE" | "PAGO" | "CANCELADO" = "PENDENTE";
+    // mapeia status do MP -> seu status do sistema
+    let nextStatus: "PENDENTE" | "PAGO" | "CANCELADO" | null = null;
+
     if (mpStatus === "approved") nextStatus = "PAGO";
     else if (mpStatus === "rejected" || mpStatus === "cancelled") nextStatus = "CANCELADO";
-    else nextStatus = "PENDENTE";
+    else {
+      // in_process, pending, etc
+      nextStatus = "PENDENTE";
+    }
 
-    // ⚠️ IMPORTANTE: se seu supabaseAdmin for FUNÇÃO, precisa chamar:
-    // const admin = supabaseAdmin();
-    // se ele já for CLIENTE pronto, usa direto:
     const admin: any = typeof supabaseAdmin === "function" ? supabaseAdmin() : supabaseAdmin;
 
+    // pega status atual do pedido
+    const { data: current, error: curErr } = await admin
+      .from("orders")
+      .select("id,status")
+      .eq("id", orderId)
+      .single();
+
+    if (curErr || !current) {
+      console.log("[MP WEBHOOK] pedido não encontrado:", orderId, curErr);
+      return NextResponse.json({ ok: false, error: "pedido não encontrado" }, { status: 404 });
+    }
+
+    const currentStatus = String(current.status || "PENDENTE");
+
+    // ✅ NÃO rebaixa status (se já é PAGO, não volta pra PENDENTE)
+    if (PRIORITY[nextStatus] < PRIORITY[currentStatus]) {
+      console.log("[MP WEBHOOK] ignorado por downgrade", { currentStatus, nextStatus });
+      return NextResponse.json({ ok: true, ignored: true, reason: "downgrade" });
+    }
+
+    // atualiza
     const { data: updated, error: upErr } = await admin
       .from("orders")
       .update({
@@ -78,12 +109,11 @@ export async function POST(req: Request) {
       .single();
 
     if (upErr) {
-      console.log("[MP WEBHOOK] erro ao atualizar pedido:", upErr);
+      console.log("[MP WEBHOOK] erro update:", upErr);
       return NextResponse.json({ ok: false, error: upErr.message }, { status: 500 });
     }
 
     console.log("[MP WEBHOOK] pedido atualizado:", updated);
-
     return NextResponse.json({ ok: true });
   } catch (e: any) {
     console.log("[MP WEBHOOK] erro geral:", e?.message || e);

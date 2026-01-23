@@ -79,13 +79,15 @@ export async function POST(req: Request) {
 
     // 🔥 GARANTIA: manda o webhook SEM depender de config no painel
     // (se seu MP mandar webhook em outro formato, o endpoint abaixo vai aceitar também)
-    const notification_url = `${siteUrl}/api/mp/webhook?secret=${encodeURIComponent(WEBHOOK_SECRET)}`;
+    const webhookUrl = `${siteUrl}/api/mp/webhook?secret=${encodeURIComponent(process.env.MP_WEBHOOK_SECRET || "")}`;
 
     const payload: any = {
-      items: mpItems,
-      back_urls,
-      external_reference: String(orderId),
-      notification_url,
+        items: mpItems,
+        back_urls,
+        external_reference: String(orderId),
+
+        // ESSENCIAL:
+        notification_url: webhookUrl,
     };
 
     if (isPublicHttps(siteUrl)) {

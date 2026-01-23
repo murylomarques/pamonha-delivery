@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
 export const runtime = "nodejs";
 
@@ -35,7 +36,9 @@ export async function POST(req: Request) {
   try {
     const MP_ACCESS_TOKEN = requireEnv("MP_ACCESS_TOKEN");
     const WEBHOOK_SECRET = requireEnv("MP_WEBHOOK_SECRET");
+
     const siteUrl = baseUrl();
+    const admin = supabaseAdmin();
 
     const body = await req.json().catch(() => ({} as any));
     const orderId: string | undefined = body?.orderId;
@@ -50,7 +53,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Sem itens para criar preferência." }, { status: 400 });
     }
 
-    // Itens no formato MP
     const mpItems = itemsRaw.map((it) => ({
       id: String(it.id),
       title: String(it.nome || `Produto ${it.id}`),
@@ -59,7 +61,6 @@ export async function POST(req: Request) {
       currency_id: "BRL",
     }));
 
-    // cobra frete como item separado
     if (frete > 0) {
       mpItems.push({
         id: "FRETE",
@@ -76,24 +77,20 @@ export async function POST(req: Request) {
       failure: `${siteUrl}/pagamento/falha?order=${encodeURIComponent(orderId)}`,
     };
 
-    // ✅ webhook com secret na URL
+    // 🔥 GARANTIA: manda o webhook SEM depender de config no painel
+    // (se seu MP mandar webhook em outro formato, o endpoint abaixo vai aceitar também)
     const notification_url = `${siteUrl}/api/mp/webhook?secret=${encodeURIComponent(WEBHOOK_SECRET)}`;
 
     const payload: any = {
       items: mpItems,
       back_urls,
       external_reference: String(orderId),
-      notification_url, // ✅ ESSENCIAL PRA ATUALIZAR STATUS
+      notification_url,
     };
 
-    // evita erro em dev e deixa auto-return só quando for https público
     if (isPublicHttps(siteUrl)) {
       payload.auto_return = "approved";
     }
-
-    console.log("[MP preference] siteUrl:", siteUrl);
-    console.log("[MP preference] notification_url:", notification_url);
-    console.log("[MP preference] payload:", JSON.stringify(payload, null, 2));
 
     const r = await fetch("https://api.mercadopago.com/checkout/preferences", {
       method: "POST",
@@ -106,12 +103,18 @@ export async function POST(req: Request) {
 
     const data = await r.json();
 
-    console.log("[MP preference] status:", r.status);
-    console.log("[MP preference] response:", data);
-
     if (!r.ok) {
-      return NextResponse.json({ error: "Mercado Pago recusou a preference", mp: data }, { status: 400 });
+      return NextResponse.json(
+        { error: "Mercado Pago recusou a preference", mp: data },
+        { status: 400 }
+      );
     }
+
+    // ✅ salva o preference_id no pedido (ajuda MUITO no debug)
+    await admin
+      .from("orders")
+      .update({ mp_preference_id: String(data.id) })
+      .eq("id", orderId);
 
     return NextResponse.json({
       id: data.id,

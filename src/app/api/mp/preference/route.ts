@@ -1,3 +1,4 @@
+// src/app/api/mp/preference/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
@@ -38,6 +39,8 @@ export async function POST(req: Request) {
     const WEBHOOK_SECRET = requireEnv("MP_WEBHOOK_SECRET");
 
     const siteUrl = baseUrl();
+
+    // ⚠️ supabaseAdmin no seu projeto é uma FUNÇÃO que retorna o client
     const admin = supabaseAdmin();
 
     const body = await req.json().catch(() => ({} as any));
@@ -53,14 +56,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Sem itens para criar preferência." }, { status: 400 });
     }
 
+    // Monta itens no formato do Mercado Pago
     const mpItems = itemsRaw.map((it) => ({
       id: String(it.id),
       title: String(it.nome || `Produto ${it.id}`),
-      quantity: Number(it.qtd || 1),
+      quantity: Math.max(1, Number(it.qtd || 1)),
       unit_price: Number(it.preco || 0),
       currency_id: "BRL",
     }));
 
+    // Frete como item separado (se quiser)
     if (frete > 0) {
       mpItems.push({
         id: "FRETE",
@@ -77,22 +82,26 @@ export async function POST(req: Request) {
       failure: `${siteUrl}/pagamento/falha?order=${encodeURIComponent(orderId)}`,
     };
 
-    // 🔥 GARANTIA: manda o webhook SEM depender de config no painel
-    // (se seu MP mandar webhook em outro formato, o endpoint abaixo vai aceitar também)
-    const webhookUrl = `${siteUrl}/api/mp/webhook?secret=${encodeURIComponent(process.env.MP_WEBHOOK_SECRET || "")}`;
+    // ✅ GARANTIA: webhook sempre apontando pro seu endpoint com secret
+    const webhookUrl = `${siteUrl}/api/mp/webhook?secret=${encodeURIComponent(WEBHOOK_SECRET)}`;
 
     const payload: any = {
-        items: mpItems,
-        back_urls,
-        external_reference: String(orderId),
+      items: mpItems,
+      back_urls,
+      external_reference: String(orderId),
 
-        // ESSENCIAL:
-        notification_url: webhookUrl,
+      // ESSENCIAL para seu webhook receber “direitinho”
+      notification_url: webhookUrl,
     };
 
+    // Só manda auto_return quando for URL pública e https
     if (isPublicHttps(siteUrl)) {
       payload.auto_return = "approved";
     }
+
+    console.log("[MP preference] siteUrl:", siteUrl);
+    console.log("[MP preference] notification_url:", webhookUrl);
+    console.log("[MP preference] payload:", JSON.stringify(payload, null, 2));
 
     const r = await fetch("https://api.mercadopago.com/checkout/preferences", {
       method: "POST",
@@ -103,7 +112,10 @@ export async function POST(req: Request) {
       body: JSON.stringify(payload),
     });
 
-    const data = await r.json();
+    const data = await r.json().catch(() => ({}));
+
+    console.log("[MP preference] status:", r.status);
+    console.log("[MP preference] response:", data);
 
     if (!r.ok) {
       return NextResponse.json(
@@ -112,11 +124,16 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ salva o preference_id no pedido (ajuda MUITO no debug)
-    await admin
+    // ✅ salva o preference_id no pedido (ajuda MUITO no debug e auditoria)
+    const { error: upErr } = await admin
       .from("orders")
       .update({ mp_preference_id: String(data.id) })
       .eq("id", orderId);
+
+    if (upErr) {
+      console.log("[MP preference] warning: falha ao salvar mp_preference_id:", upErr);
+      // não quebra o checkout por causa disso
+    }
 
     return NextResponse.json({
       id: data.id,
@@ -124,6 +141,7 @@ export async function POST(req: Request) {
       sandbox_init_point: data.sandbox_init_point,
     });
   } catch (e: any) {
+    console.log("[MP preference] erro:", e?.message || e);
     return NextResponse.json({ error: e?.message || "Erro inesperado." }, { status: 500 });
   }
 }

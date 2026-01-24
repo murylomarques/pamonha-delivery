@@ -9,75 +9,99 @@ function mustEnv(name: string) {
   return v;
 }
 
-// só pra deixar claro a prioridade de status
 const PRIORITY: Record<string, number> = {
   PENDENTE: 1,
   CANCELADO: 2,
   PAGO: 3,
 };
 
+function isNumericId(v: any) {
+  const s = String(v ?? "").trim();
+  return /^[0-9]+$/.test(s);
+}
+
 export async function POST(req: Request) {
   try {
     const url = new URL(req.url);
     const secret = url.searchParams.get("secret");
-
     const WEBHOOK_SECRET = mustEnv("MP_WEBHOOK_SECRET");
-    const MP_ACCESS_TOKEN = mustEnv("MP_ACCESS_TOKEN");
 
     if (!secret || secret !== WEBHOOK_SECRET) {
       console.log("[MP WEBHOOK] unauthorized");
-      return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+      return NextResponse.json({ ok: false }, { status: 401 });
     }
 
-    const body = await req.json().catch(() => null);
-    console.log("[MP WEBHOOK] body:", JSON.stringify(body));
+    const MP_ACCESS_TOKEN = mustEnv("MP_ACCESS_TOKEN");
 
-    // MP pode mandar o ID em formatos diferentes
-    const paymentId =
-      body?.data?.id ||
-      body?.id ||
-      body?.resource?.split("/")?.pop() ||
+    const body = await req.json().catch(() => null);
+
+    // O MP pode mandar em formatos diferentes:
+    // - body.data.id (quando é payment)
+    // - query params (?id=...&topic=payment)
+    // - body.resource (às vezes é uma URL)
+    const qpId = url.searchParams.get("id");
+    const qpTopic = url.searchParams.get("topic") || url.searchParams.get("type");
+
+    const paymentIdRaw =
+      body?.data?.id ??
+      body?.id ??
+      qpId ??
+      body?.resource?.split("/")?.pop() ??
       body?.resource_id;
 
-    if (!paymentId) {
-      console.log("[MP WEBHOOK] ignored (sem paymentId)");
+    const typeRaw = body?.type ?? qpTopic ?? body?.action ?? body?.topic;
+
+    console.log("[MP WEBHOOK] type:", typeRaw, "paymentIdRaw:", paymentIdRaw);
+
+    // ✅ Se não tiver id ou não for numérico, isso NÃO é paymentId
+    // (é um merchant_order, ou outra notificação)
+    if (!paymentIdRaw || !isNumericId(paymentIdRaw)) {
+      console.log("[MP WEBHOOK] ignored (not a payment id).", {
+        type: typeRaw,
+        paymentIdRaw,
+      });
       return NextResponse.json({ ok: true, ignored: true });
     }
 
-    // busca o pagamento real no MP
+    const paymentId = String(paymentIdRaw);
+
+    // Busca o pagamento real no MP (fonte de verdade)
     const payRes = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
     });
 
-    const pay = await payRes.json();
+    const pay = await payRes.json().catch(() => ({}));
     console.log("[MP WEBHOOK] payment fetch status:", payRes.status);
     console.log("[MP WEBHOOK] payment data:", JSON.stringify(pay));
 
+    // ✅ Se deu 404 aqui, pode ser evento “adiantado”/ruim. NÃO retorna 400.
+    // Retorna 200 pra não ficar retry infinito.
+    if (payRes.status === 404) {
+      console.log("[MP WEBHOOK] ignored (payment not found yet):", paymentId);
+      return NextResponse.json({ ok: true, ignored: true, reason: "payment_not_found" });
+    }
+
     if (!payRes.ok) {
-      return NextResponse.json({ ok: false, error: pay }, { status: 400 });
+      console.log("[MP WEBHOOK] ignored (mp error):", payRes.status);
+      return NextResponse.json({ ok: true, ignored: true, reason: "mp_error" });
     }
 
     const mpStatus = String(pay.status || "").toLowerCase();
     const orderId = String(pay.external_reference || "");
 
     if (!orderId) {
-      console.log("[MP WEBHOOK] sem external_reference");
-      return NextResponse.json({ ok: true, warning: "sem external_reference" });
+      console.log("[MP WEBHOOK] ignored (sem external_reference)");
+      return NextResponse.json({ ok: true, ignored: true, reason: "no_external_reference" });
     }
 
-    // mapeia status do MP -> seu status do sistema
-    let nextStatus: "PENDENTE" | "PAGO" | "CANCELADO" | null = null;
-
+    let nextStatus: "PENDENTE" | "PAGO" | "CANCELADO" = "PENDENTE";
     if (mpStatus === "approved") nextStatus = "PAGO";
     else if (mpStatus === "rejected" || mpStatus === "cancelled") nextStatus = "CANCELADO";
-    else {
-      // in_process, pending, etc
-      nextStatus = "PENDENTE";
-    }
+    else nextStatus = "PENDENTE";
 
     const admin: any = typeof supabaseAdmin === "function" ? supabaseAdmin() : supabaseAdmin;
 
-    // pega status atual do pedido
+    // Status atual do pedido
     const { data: current, error: curErr } = await admin
       .from("orders")
       .select("id,status")
@@ -86,23 +110,22 @@ export async function POST(req: Request) {
 
     if (curErr || !current) {
       console.log("[MP WEBHOOK] pedido não encontrado:", orderId, curErr);
-      return NextResponse.json({ ok: false, error: "pedido não encontrado" }, { status: 404 });
+      return NextResponse.json({ ok: true, ignored: true, reason: "order_not_found" });
     }
 
     const currentStatus = String(current.status || "PENDENTE");
 
-    // ✅ NÃO rebaixa status (se já é PAGO, não volta pra PENDENTE)
+    // ✅ Nunca “rebaixa” (PAGO não volta pra PENDENTE)
     if (PRIORITY[nextStatus] < PRIORITY[currentStatus]) {
-      console.log("[MP WEBHOOK] ignorado por downgrade", { currentStatus, nextStatus });
+      console.log("[MP WEBHOOK] ignored downgrade", { currentStatus, nextStatus, paymentId });
       return NextResponse.json({ ok: true, ignored: true, reason: "downgrade" });
     }
 
-    // atualiza
     const { data: updated, error: upErr } = await admin
       .from("orders")
       .update({
         status: nextStatus,
-        mp_payment_id: String(paymentId),
+        mp_payment_id: paymentId,
       })
       .eq("id", orderId)
       .select("id,status,mp_payment_id")
@@ -110,13 +133,15 @@ export async function POST(req: Request) {
 
     if (upErr) {
       console.log("[MP WEBHOOK] erro update:", upErr);
-      return NextResponse.json({ ok: false, error: upErr.message }, { status: 500 });
+      // também não retorna 500 pro MP ficar retryando eternamente
+      return NextResponse.json({ ok: true, ignored: true, reason: "db_error" });
     }
 
     console.log("[MP WEBHOOK] pedido atualizado:", updated);
     return NextResponse.json({ ok: true });
   } catch (e: any) {
     console.log("[MP WEBHOOK] erro geral:", e?.message || e);
-    return NextResponse.json({ ok: false, error: e?.message || "Erro" }, { status: 500 });
+    // ❗ importante: 200 mesmo com erro pra evitar spam de retry
+    return NextResponse.json({ ok: true, ignored: true, reason: "exception" });
   }
 }

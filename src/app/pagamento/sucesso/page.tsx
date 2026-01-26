@@ -1,106 +1,191 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { supabase } from "@/lib/supabaseClient";
 
-function getParam(name: string) {
-  if (typeof window === "undefined") return "";
-  const u = new URL(window.location.href);
-  return u.searchParams.get(name) || "";
+type OrderStatus = "PENDENTE" | "PAGO" | "CANCELADO";
+
+type OrderRow = {
+  id: string;
+  user_id: string;
+  status: OrderStatus;
+  total: number;
+  mp_payment_id: string | null;
+  created_at: string;
+};
+
+function formatBRL(v: number) {
+  return (Number(v) || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+function fmtDate(d: string | null | undefined) {
+  if (!d) return "-";
+  try {
+    return new Date(d).toLocaleString("pt-BR");
+  } catch {
+    return String(d);
+  }
 }
 
 export default function PagamentoSucessoPage() {
-  const orderId = useMemo(() => getParam("order"), []);
-  const paymentId = useMemo(
-    () => getParam("payment_id") || getParam("collection_id"),
-    []
-  );
+  const sp = useSearchParams();
+  const router = useRouter();
 
-  const [status, setStatus] = useState<"loading" | "ok" | "warn" | "err">("loading");
-  const [text, setText] = useState("Confirmando pagamento...");
+  const orderId = useMemo(() => sp.get("order") || "", [sp]);
+
+  const [loading, setLoading] = useState(true);
+  const [order, setOrder] = useState<OrderRow | null>(null);
+  const [info, setInfo] = useState<string>("");
 
   useEffect(() => {
-    (async () => {
+    let stopped = false;
+
+    async function run() {
       try {
         if (!orderId) {
-          setStatus("err");
-          setText("Pedido não informado na URL.");
+          setInfo("Pedido não informado.");
+          setLoading(false);
           return;
         }
 
-        // Se não veio payment_id, ainda assim mostra sucesso e deixa o webhook agir
-        if (!paymentId) {
-          setStatus("warn");
-          setText("Pagamento recebido. Estamos aguardando confirmação automática (webhook).");
+        // 1) exige usuário logado
+        const { data: auth } = await supabase.auth.getUser();
+        const user = auth?.user;
+
+        if (!user) {
+          // se não estiver logado, manda pro login
+          router.replace(`/login?next=${encodeURIComponent(`/pagamento/sucesso?order=${orderId}`)}`);
           return;
         }
 
-        const r = await fetch("/api/mp/verify", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ orderId, paymentId }),
-        });
+        // 2) busca pedido
+        const { data, error } = await supabase
+          .from("orders")
+          .select("id,user_id,status,total,mp_payment_id,created_at")
+          .eq("id", orderId)
+          .single();
 
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) {
-          setStatus("warn");
-          setText("Pagamento retornou sucesso, mas não consegui confirmar agora. Aguarde alguns segundos.");
+        if (stopped) return;
+
+        if (error || !data) {
+          setInfo("Pedido não encontrado.");
+          setOrder(null);
+          setLoading(false);
           return;
         }
 
-        setStatus("ok");
-        setText(`Pagamento confirmado! Status do pedido: ${j.status}`);
+        // 3) só dono (ou admin via RLS/policy) pode ver
+        // Se sua RLS permitir apenas o dono, isso já bloqueia automaticamente.
+        // Mesmo assim, deixo a validação extra:
+        if (data.user_id !== user.id) {
+          setInfo("Você não tem permissão para ver esse pedido.");
+          setOrder(null);
+          setLoading(false);
+          return;
+        }
+
+        // 4) trava a tela pelo STATUS real do banco
+        if (data.status === "PENDENTE") {
+          router.replace(`/pagamento/pendente?order=${encodeURIComponent(orderId)}`);
+          return;
+        }
+
+        if (data.status === "CANCELADO") {
+          router.replace(`/pagamento/falha?order=${encodeURIComponent(orderId)}`);
+          return;
+        }
+
+        // status PAGO
+        setOrder(data as any);
+        setInfo("Pagamento confirmado ✅");
+        setLoading(false);
       } catch {
-        setStatus("warn");
-        setText("Pagamento retornou sucesso. Se o status não atualizar em alguns minutos, recarregue a página.");
+        if (!stopped) {
+          setInfo("Erro ao verificar o pedido.");
+          setLoading(false);
+        }
       }
-    })();
-  }, [orderId, paymentId]);
+    }
+
+    run();
+
+    return () => {
+      stopped = true;
+    };
+  }, [orderId, router]);
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-6">
-      <div className="w-full max-w-lg rounded-3xl border border-white/10 bg-white/5 p-6">
-        <div className="flex items-start gap-3">
-          <div className="grid h-12 w-12 place-items-center rounded-2xl bg-emerald-500/10 border border-emerald-500/20">
-            ✅
-          </div>
-          <div className="min-w-0">
-            <h1 className="text-xl font-semibold">Pagamento concluído</h1>
-            <p className="mt-1 text-sm text-zinc-400">
-              Pedido: <span className="text-zinc-200">{orderId || "-"}</span>
-            </p>
-          </div>
-        </div>
-
-        <div
-          className={`mt-5 rounded-2xl border p-4 text-sm ${
-            status === "ok"
-              ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-200"
-              : status === "err"
-              ? "border-rose-500/20 bg-rose-500/10 text-rose-200"
-              : "border-amber-500/20 bg-amber-500/10 text-amber-200"
-          }`}
-        >
-          {text}
-        </div>
-
-        <div className="mt-5 grid grid-cols-1 gap-2 sm:grid-cols-2">
-          <a
-            href="/minha-conta/pedidos"
-            className="rounded-2xl bg-white px-4 py-3 text-center text-sm font-semibold text-zinc-900 hover:bg-zinc-200"
-          >
-            Ver meus pedidos
-          </a>
-          <a
-            href="/"
-            className="rounded-2xl border border-white/10 bg-zinc-950/20 px-4 py-3 text-center text-sm font-semibold hover:bg-white/5"
-          >
-            Voltar pra loja
-          </a>
-        </div>
-
-        <p className="mt-4 text-xs text-zinc-500">
-          Se o status não mudar na hora, pode levar alguns segundos até o webhook processar.
+    <div className="mx-auto max-w-2xl p-6 text-zinc-100">
+      <div className="rounded-3xl border border-white/10 bg-white/5 p-6">
+        <h1 className="text-2xl font-semibold tracking-tight">Pagamento confirmado ✅</h1>
+        <p className="mt-2 text-sm text-zinc-300">
+          Esta tela só aparece quando o status do pedido está <b>PAGO</b> no banco (webhook).
         </p>
+
+        <div className="mt-6 grid gap-4">
+          <div className="rounded-3xl border border-emerald-500/20 bg-emerald-500/10 p-5">
+            <div className="text-xs text-emerald-200/80">STATUS</div>
+            <div className="mt-1 text-lg font-semibold text-emerald-100">{info || "..."}</div>
+          </div>
+
+          <div className="rounded-3xl border border-white/10 bg-zinc-950/20 p-5">
+            {loading ? (
+              <div className="animate-pulse text-sm text-zinc-300">Verificando pedido...</div>
+            ) : !order ? (
+              <div className="text-sm text-rose-200">{info || "Não foi possível carregar."}</div>
+            ) : (
+              <div className="space-y-3 text-sm">
+                <div className="flex items-center justify-between">
+                  <span className="text-zinc-400">Pedido</span>
+                  <span className="font-semibold">{order.id}</span>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-zinc-400">Status (BD)</span>
+                  <span className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs font-semibold text-emerald-200">
+                    {order.status}
+                  </span>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-zinc-400">Total</span>
+                  <span className="font-semibold">{formatBRL(Number(order.total))}</span>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-zinc-400">Criado</span>
+                  <span className="font-semibold">{fmtDate(order.created_at)}</span>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-zinc-400">MP Payment ID</span>
+                  <span className="font-semibold">{order.mp_payment_id || "-"}</span>
+                </div>
+
+                <div className="mt-2 rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-zinc-300">
+                  Segurança: entrar direto nessa URL não aprova nada — o que vale é o status do pedido no banco.
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={() => router.push("/minha-conta/pedidos")}
+              className="rounded-2xl bg-white px-4 py-3 text-sm font-semibold text-zinc-900 hover:bg-zinc-200"
+            >
+              Ver meus pedidos
+            </button>
+
+            <button
+              onClick={() => router.push("/")}
+              className="rounded-2xl border border-white/10 bg-zinc-950/20 px-4 py-3 text-sm font-semibold hover:bg-white/5"
+            >
+              Voltar para o início
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

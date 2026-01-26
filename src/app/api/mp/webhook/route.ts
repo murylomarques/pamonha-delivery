@@ -4,64 +4,143 @@ import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
 export const runtime = "nodejs";
 
-type OrderStatus = "PENDENTE" | "PAGO" | "CANCELADO";
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 function requireEnv(name: string) {
   const v = process.env[name];
   if (!v) throw new Error(`Variável de ambiente ausente: ${name}`);
   return v;
 }
 
-function extractPaymentId(req: Request, body: any): string | null {
-  // 1) formato comum: { type: "payment", data: { id: "123" } }
-  const id1 = body?.data?.id;
-  if (id1) return String(id1);
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
-  // 2) alguns casos: { id: "123" }
-  const id2 = body?.id;
-  if (id2) return String(id2);
-
-  // 3) query: /webhook?id=123 ou /webhook?data.id=123
+/**
+ * Mercado Pago pode mandar:
+ * - JSON: { type: "payment", data: { id: "123" } }
+ * - JSON: { action: "payment.created", data: { id: "123" } }
+ * - query: ?type=payment&data.id=123
+ * - query: ?topic=payment&id=123
+ * - query: ?topic=merchant_order&id=999  (NÃO É payment!)
+ * - JSON com resource/href: "/v1/payments/123" (ou URL completa)
+ */
+function extractMpEvent(req: Request, body: any): {
+  kind?: string;
+  paymentId?: string;
+  rawId?: string;
+  debug: any;
+} {
   const url = new URL(req.url);
-  const q1 = url.searchParams.get("id");
-  if (q1) return String(q1);
 
-  // 4) resource: "/v1/payments/123"
-  const res = body?.resource;
-  if (typeof res === "string") {
-    const m = res.match(/\/payments\/(\d+)/);
-    if (m?.[1]) return String(m[1]);
+  // query patterns
+  const qKind =
+    url.searchParams.get("type") ||
+    url.searchParams.get("topic") ||
+    undefined;
+
+  const qId =
+    url.searchParams.get("data.id") ||
+    url.searchParams.get("id") ||
+    undefined;
+
+  // body patterns
+  const bType = body?.type || body?.topic || undefined;
+
+  // action: "payment.created" -> kind = "payment"
+  const action = typeof body?.action === "string" ? body.action : "";
+  const bActionKind = action.includes(".") ? action.split(".")[0] : undefined;
+
+  const bId =
+    body?.data?.id ||
+    body?.id ||
+    undefined;
+
+  // resource patterns
+  const resource = body?.resource || body?.data?.resource || body?.href;
+  let resourcePaymentId: string | undefined;
+  let resourceKind: string | undefined;
+
+  if (typeof resource === "string") {
+    // payment resource
+    const mPay = resource.match(/payments\/(\d+)/);
+    if (mPay?.[1]) {
+      resourcePaymentId = mPay[1];
+      resourceKind = "payment";
+    }
+
+    // merchant_order resource (não é payment)
+    const mMo = resource.match(/merchant_orders\/(\d+)/);
+    if (mMo?.[1]) {
+      resourceKind = "merchant_order";
+    }
   }
 
-  // 5) topic/type/action podem vir diferentes, mas o id costuma vir nos lugares acima
-  return null;
+  // prioridade de kind
+  const kind = (qKind || bType || bActionKind || resourceKind || undefined)?.toString();
+
+  // prioridade de id
+  const rawId = (qId || bId || resourcePaymentId || undefined)?.toString();
+
+  return {
+    kind,
+    paymentId: rawId, // pode ser merchant_order id — vamos filtrar abaixo
+    rawId,
+    debug: {
+      qKind,
+      qId,
+      bType,
+      action,
+      bActionKind,
+      bId,
+      resource,
+      resourceKind,
+      resourcePaymentId,
+    },
+  };
 }
 
-function extractTopic(body: any, req: Request): string {
-  const url = new URL(req.url);
-  return (
-    String(body?.type || body?.topic || body?.action || url.searchParams.get("topic") || "").toLowerCase()
-  );
+async function fetchPaymentWithRetry(paymentId: string, token: string) {
+  // O MP às vezes notifica antes do payment ficar disponível
+  const waits = [0, 700, 1400]; // ms
+  let last: any = null;
+
+  for (const w of waits) {
+    if (w) await sleep(w);
+
+    const res = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+    });
+
+    const data = await res.json().catch(() => ({}));
+    last = { ok: res.ok, status: res.status, data };
+
+    if (res.ok) return last;
+
+    // 404 pode ser “cedo” OU pode ser “não é payment mesmo”
+    if (res.status !== 404) break;
+  }
+
+  return last;
 }
 
-function mapMPStatusToOrderStatus(mpStatusRaw: any): OrderStatus {
+function mapMpStatus(mpStatusRaw: string): "PENDENTE" | "PAGO" | "CANCELADO" {
   const s = String(mpStatusRaw || "").toLowerCase();
 
-  // approved -> PAGO
   if (s === "approved") return "PAGO";
 
-  // rejected/cancelled -> CANCELADO
-  if (s === "rejected" || s === "cancelled") return "CANCELADO";
+  if (s === "rejected" || s === "cancelled" || s === "charged_back" || s === "refunded") {
+    return "CANCELADO";
+  }
 
-  // pending/in_process/authorized/etc -> PENDENTE
-  return "PENDENTE";
+  return "PENDENTE"; // pending, in_process, etc
 }
 
-export async function POST(req: Request) {
+function isTerminal(status: string) {
+  const s = String(status || "").toUpperCase();
+  return s === "PAGO" || s === "CANCELADO";
+}
+
+async function handle(req: Request) {
   try {
     const WEBHOOK_SECRET = requireEnv("MP_WEBHOOK_SECRET");
     const MP_ACCESS_TOKEN = requireEnv("MP_ACCESS_TOKEN");
@@ -69,128 +148,125 @@ export async function POST(req: Request) {
     const url = new URL(req.url);
     const secret = url.searchParams.get("secret");
 
-    // proteção
     if (!secret || secret !== WEBHOOK_SECRET) {
       return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
     }
 
-    const body = await req.json().catch(() => ({} as any));
+    // GET pode vir sem body
+    let body: any = {};
+    if (req.method === "POST") {
+      body = await req.json().catch(() => ({}));
+    }
 
-    const topic = extractTopic(body, req);
-    const paymentId = extractPaymentId(req, body);
+    const extracted = extractMpEvent(req, body);
+    const kind = extracted.kind ? String(extracted.kind).toLowerCase() : undefined;
+    const maybeId = extracted.paymentId ? String(extracted.paymentId) : undefined;
 
-    // Mercado Pago manda vários tipos — a gente só processa quando conseguir o paymentId
-    if (!paymentId) {
-      console.log("[MP WEBHOOK] ignored. topic:", topic, "body_keys:", Object.keys(body || {}));
+    // Se veio tópico diferente de payment, ignora imediatamente
+    // (merchant_order é MUITO comum e não é payment)
+    if (kind && kind !== "payment") {
+      console.log("[MP WEBHOOK] ignored (not payment kind):", { kind, id: maybeId });
       return NextResponse.json({ ok: true, ignored: true });
     }
 
-    // Buscar o pagamento no MP com retry (às vezes chega antes do pagamento “existir”)
-    let pay: any = null;
-    let lastErr: any = null;
+    if (!maybeId) {
+      console.log("[MP WEBHOOK] ignored (no id):", extracted.debug);
+      return NextResponse.json({ ok: true, ignored: true });
+    }
 
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      const payRes = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
-        headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+    // Busca payment no MP (se for 404, pode ser cedo OU id não é payment)
+    const paymentRes = await fetchPaymentWithRetry(maybeId, MP_ACCESS_TOKEN);
+
+    if (!paymentRes?.ok) {
+      if (paymentRes?.status === 404) {
+        console.log("[MP WEBHOOK] ignored (payment not found yet):", maybeId);
+        return NextResponse.json({ ok: true, ignored: true });
+      }
+
+      console.log("[MP WEBHOOK] payment fetch error:", {
+        id: maybeId,
+        status: paymentRes?.status,
+        data: paymentRes?.data,
       });
 
-      pay = await payRes.json().catch(() => ({}));
-
-      if (payRes.ok) {
-        lastErr = null;
-        break;
-      }
-
-      lastErr = pay;
-
-      // 404 Payment not found -> espera e tenta de novo
-      if (payRes.status === 404) {
-        console.log("[MP WEBHOOK] payment not found yet:", paymentId, "attempt:", attempt);
-        await sleep(800);
-        continue;
-      }
-
-      // outros erros: não adianta insistir tanto
-      console.log("[MP WEBHOOK] payment fetch error:", payRes.status, pay);
-      break;
+      return NextResponse.json({ ok: false, error: paymentRes?.data }, { status: 400 });
     }
 
-    // Se ainda não encontrou, responde 200 (IMPORTANTÍSSIMO) pra não ficar loopando com 400
-    if (lastErr && String(lastErr?.error || "").toLowerCase() === "not_found") {
-      console.log("[MP WEBHOOK] ignored (payment not found yet):", paymentId);
-      return NextResponse.json({ ok: true, ignored: true, reason: "not_found_yet" });
-    }
+    const pay = paymentRes.data;
 
-    // Se falhou por outro motivo, responde 200 mas loga
-    if (!pay || !pay?.id) {
-      console.log("[MP WEBHOOK] payment invalid response:", pay);
-      return NextResponse.json({ ok: true, ignored: true, reason: "invalid_payment" });
-    }
-
-    // Pega orderId do external_reference (você setou isso no preference ✅)
-    const orderId = String(pay.external_reference || "");
+    const orderId = String(pay?.external_reference || "");
     if (!orderId) {
-      console.log("[MP WEBHOOK] warning: sem external_reference. payment:", pay?.id);
-      return NextResponse.json({ ok: true, ignored: true, reason: "no_external_reference" });
+      console.log("[MP WEBHOOK] warning: sem external_reference:", {
+        paymentId: maybeId,
+        mpStatus: pay?.status,
+      });
+      return NextResponse.json({ ok: true, warning: "no external_reference" });
     }
 
-    const nextStatus = mapMPStatusToOrderStatus(pay.status);
+    const nextStatus = mapMpStatus(pay?.status);
+
     const admin = supabaseAdmin();
 
-    // Idempotência: não deixar rebaixar pedido já pago
-    const { data: current, error: curErr } = await admin
+    // status atual (pra não permitir regressão)
+    const { data: currentOrder, error: curErr } = await admin
       .from("orders")
-      .select("id,status")
+      .select("id,status,mp_payment_id")
       .eq("id", orderId)
       .single();
 
-    if (curErr || !current) {
-      console.log("[MP WEBHOOK] order not found:", orderId, "err:", curErr);
-      return NextResponse.json({ ok: true, ignored: true, reason: "order_not_found" });
+    if (curErr || !currentOrder) {
+      console.log("[MP WEBHOOK] ignored (order not found):", { orderId, err: curErr?.message });
+      return NextResponse.json({ ok: true, ignored: true });
     }
 
-    const curStatus = String(current.status || "PENDENTE").toUpperCase() as OrderStatus;
+    const curStatus = String(currentOrder.status || "PENDENTE").toUpperCase();
 
-    // Se já está PAGO, nunca volta pra PENDENTE/CANCELADO por evento fora de ordem
-    if (curStatus === "PAGO" && nextStatus !== "PAGO") {
-      console.log("[MP WEBHOOK] ignored (already paid):", {
-        orderId,
-        curStatus,
-        mpStatus: pay.status,
-        paymentId: String(pay.id),
-      });
-
-      // mesmo assim salva payment_id (opcional, mas útil)
-      await admin
-        .from("orders")
-        .update({ mp_payment_id: String(pay.id) })
-        .eq("id", orderId);
-
-      return NextResponse.json({ ok: true, ignored: true, reason: "already_paid" });
+    // 1) Se já terminal, nunca muda pra trás
+    if (isTerminal(curStatus) && String(nextStatus).toUpperCase() !== curStatus) {
+      console.log("[MP WEBHOOK] ignored (terminal, no downgrade):", { orderId, curStatus, nextStatus });
+      return NextResponse.json({ ok: true, ignored: true });
     }
 
-    // Atualiza pedido
+    // 2) Se já é PAGO e veio de novo PAGO, ok (idempotência)
+    // 3) Se veio PENDENTE e já estava PENDENTE, ok (sem necessidade)
+    if (curStatus === String(nextStatus).toUpperCase() && String(currentOrder.mp_payment_id || "") === String(maybeId)) {
+      console.log("[MP WEBHOOK] ok (idempotent):", { orderId, status: curStatus, mp_payment_id: maybeId });
+      return NextResponse.json({ ok: true });
+    }
+
+    const payload: any = {
+      status: nextStatus,
+      mp_payment_id: String(maybeId),
+    };
+
     const { data: updated, error: upErr } = await admin
       .from("orders")
-      .update({
-        status: nextStatus,
-        mp_payment_id: String(pay.id),
-      })
+      .update(payload)
       .eq("id", orderId)
       .select("id,status,mp_payment_id")
       .single();
 
     if (upErr) {
-      console.log("[MP WEBHOOK] update error:", upErr);
-      // responde 200 pra MP não ficar rebatendo infinito
-      return NextResponse.json({ ok: true, warning: "update_failed" });
+      console.log("[MP WEBHOOK] erro update order:", upErr.message);
+      return NextResponse.json({ ok: false, error: upErr.message }, { status: 500 });
     }
 
-    console.log("[MP WEBHOOK] pedido atualizado:", updated);
+    console.log("[MP WEBHOOK] pedido atualizado:", updated, {
+      mp_status: pay?.status,
+      mp_status_detail: pay?.status_detail,
+    });
+
     return NextResponse.json({ ok: true });
   } catch (e: any) {
     console.log("[MP WEBHOOK] erro:", e?.message || e);
-    // responde 200 pra não virar “tempestade” de retry do MP
-    return NextResponse.json({ ok: true, warning: "exception" });
+    return NextResponse.json({ ok: false, error: e?.message || "Erro" }, { status: 500 });
   }
+}
+
+export async function POST(req: Request) {
+  return handle(req);
+}
+
+export async function GET(req: Request) {
+  return handle(req);
 }

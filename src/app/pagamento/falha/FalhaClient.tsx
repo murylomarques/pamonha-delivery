@@ -7,7 +7,7 @@ export default function PagamentoFalhaPage() {
     <Suspense fallback={<FalhaFallback />}>
       <FalhaClient />
     </Suspense>
-  ); 
+  );
 }
 
 function FalhaFallback() {

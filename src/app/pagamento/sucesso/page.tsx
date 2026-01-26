@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 
@@ -28,10 +28,9 @@ function fmtDate(d: string | null | undefined) {
   }
 }
 
-export default function PagamentoSucessoPage() {
+function Inner() {
   const sp = useSearchParams();
   const router = useRouter();
-
   const orderId = useMemo(() => sp.get("order") || "", [sp]);
 
   const [loading, setLoading] = useState(true);
@@ -49,17 +48,14 @@ export default function PagamentoSucessoPage() {
           return;
         }
 
-        // 1) exige usuário logado
         const { data: auth } = await supabase.auth.getUser();
         const user = auth?.user;
 
         if (!user) {
-          // se não estiver logado, manda pro login
           router.replace(`/login?next=${encodeURIComponent(`/pagamento/sucesso?order=${orderId}`)}`);
           return;
         }
 
-        // 2) busca pedido
         const { data, error } = await supabase
           .from("orders")
           .select("id,user_id,status,total,mp_payment_id,created_at")
@@ -75,9 +71,6 @@ export default function PagamentoSucessoPage() {
           return;
         }
 
-        // 3) só dono (ou admin via RLS/policy) pode ver
-        // Se sua RLS permitir apenas o dono, isso já bloqueia automaticamente.
-        // Mesmo assim, deixo a validação extra:
         if (data.user_id !== user.id) {
           setInfo("Você não tem permissão para ver esse pedido.");
           setOrder(null);
@@ -85,7 +78,6 @@ export default function PagamentoSucessoPage() {
           return;
         }
 
-        // 4) trava a tela pelo STATUS real do banco
         if (data.status === "PENDENTE") {
           router.replace(`/pagamento/pendente?order=${encodeURIComponent(orderId)}`);
           return;
@@ -96,7 +88,6 @@ export default function PagamentoSucessoPage() {
           return;
         }
 
-        // status PAGO
         setOrder(data as any);
         setInfo("Pagamento confirmado ✅");
         setLoading(false);
@@ -188,5 +179,21 @@ export default function PagamentoSucessoPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function PagamentoSucessoPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="mx-auto max-w-2xl p-6 text-zinc-100">
+          <div className="rounded-3xl border border-white/10 bg-white/5 p-6">
+            <div className="animate-pulse text-sm text-zinc-300">Carregando...</div>
+          </div>
+        </div>
+      }
+    >
+      <Inner />
+    </Suspense>
   );
 }

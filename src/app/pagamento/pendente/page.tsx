@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 
@@ -27,7 +27,7 @@ function fmtDate(d: string | null | undefined) {
   }
 }
 
-export default function PagamentoPendentePage() {
+function Inner() {
   const sp = useSearchParams();
   const router = useRouter();
 
@@ -36,18 +36,20 @@ export default function PagamentoPendentePage() {
   const [loading, setLoading] = useState(true);
   const [order, setOrder] = useState<OrderRow | null>(null);
   const [info, setInfo] = useState<string>("");
-  const [tries, setTries] = useState(0);
 
-  // polling: consulta o pedido a cada X segundos até virar PAGO/CANCELADO
+  // evita bug de "tries" stale dentro do setTimeout
+  const triesRef = useRef(0);
+  const stoppedRef = useRef(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   useEffect(() => {
+    stoppedRef.current = false;
+
     if (!orderId) {
       setInfo("Pedido não informado na URL.");
       setLoading(false);
       return;
     }
-
-    let timer: any = null;
-    let stopped = false;
 
     async function loadOnce() {
       const { data, error } = await supabase
@@ -56,7 +58,7 @@ export default function PagamentoPendentePage() {
         .eq("id", orderId)
         .single();
 
-      if (stopped) return;
+      if (stoppedRef.current) return;
 
       if (error || !data) {
         setInfo("Não encontramos esse pedido.");
@@ -68,40 +70,38 @@ export default function PagamentoPendentePage() {
       setOrder(data as any);
       setLoading(false);
 
-      // Se finalizou, redireciona (opcional) ou apenas muda mensagem
       if (data.status === "PAGO") {
         setInfo("Pagamento confirmado ✅ Redirecionando...");
-        setTimeout(() => {
-          if (!stopped) router.push(`/pagamento/sucesso?order=${encodeURIComponent(orderId)}`);
+        timerRef.current = setTimeout(() => {
+          if (!stoppedRef.current) router.push(`/pagamento/sucesso?order=${encodeURIComponent(orderId)}`);
         }, 800);
         return;
       }
 
       if (data.status === "CANCELADO") {
         setInfo("Pagamento cancelado ❌ Redirecionando...");
-        setTimeout(() => {
-          if (!stopped) router.push(`/pagamento/falha?order=${encodeURIComponent(orderId)}`);
+        timerRef.current = setTimeout(() => {
+          if (!stoppedRef.current) router.push(`/pagamento/falha?order=${encodeURIComponent(orderId)}`);
         }, 800);
         return;
       }
 
-      // Continua pendente
       setInfo("Aguardando confirmação do pagamento ⏳");
-      setTries((t) => t + 1);
+      triesRef.current += 1;
 
-      // Intervalo progressivo leve (evita martelar)
-      const nextMs = tries < 5 ? 2000 : tries < 20 ? 3000 : 4500;
-      timer = setTimeout(loadOnce, nextMs);
+      const t = triesRef.current;
+      const nextMs = t < 5 ? 2000 : t < 20 ? 3000 : 4500;
+
+      timerRef.current = setTimeout(loadOnce, nextMs);
     }
 
     loadOnce();
 
     return () => {
-      stopped = true;
-      if (timer) clearTimeout(timer);
+      stoppedRef.current = true;
+      if (timerRef.current) clearTimeout(timerRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [orderId]);
+  }, [orderId, router]);
 
   return (
     <div className="mx-auto max-w-2xl p-6 text-zinc-100">
@@ -163,8 +163,8 @@ export default function PagamentoPendentePage() {
                 </div>
 
                 <div className="mt-2 rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-zinc-300">
-                  Se o pagamento já foi feito e continuar pendente por muito tempo, pode ser que o webhook tenha
-                  atrasado. Essa tela vai atualizar sozinha.
+                  Se o pagamento já foi feito e continuar pendente por muito tempo, pode ser que o webhook tenha atrasado.
+                  Essa tela vai atualizar sozinha.
                 </div>
               </div>
             )}
@@ -199,5 +199,21 @@ export default function PagamentoPendentePage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function PagamentoPendentePage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="mx-auto max-w-2xl p-6 text-zinc-100">
+          <div className="rounded-3xl border border-white/10 bg-white/5 p-6">
+            <div className="animate-pulse text-sm text-zinc-300">Carregando...</div>
+          </div>
+        </div>
+      }
+    >
+      <Inner />
+    </Suspense>
   );
 }

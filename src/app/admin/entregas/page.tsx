@@ -100,6 +100,26 @@ function waLink(phone: string, text: string) {
   return `https://wa.me/${cc}?text=${encodeURIComponent(text)}`;
 }
 
+function telLink(phone: string) {
+  const d = onlyDigits(phone);
+  if (!d) return "";
+  const cc = d.startsWith("55") ? d : `55${d}`;
+  return `tel:+${cc}`;
+}
+
+function mailLink(email: string, subject: string) {
+  if (!email) return "";
+  return `mailto:${email}?subject=${encodeURIComponent(subject)}`;
+}
+
+function fullAddress(o: { rua: string; numero: string; complemento?: string; cidade: string; cep: string }) {
+  return `${o.rua}, ${o.numero}${o.complemento ? ` - ${o.complemento}` : ""} - ${o.cidade} - CEP ${o.cep}`;
+}
+
+function mapsLink(o: { rua: string; numero: string; complemento?: string; cidade: string; cep: string }) {
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(fullAddress(o))}`;
+}
+
 function downloadCSV(filename: string, rows: Record<string, any>[]) {
   const headers = Array.from(
     rows.reduce((s, r) => {
@@ -163,7 +183,11 @@ export default function AdminEntregasPage() {
         id,user_id,cidade,dia_semana,cep,rua,numero,complemento,
         subtotal,frete,total,status,created_at,
         delivery_status,delivery_notes,delivered_at,
-        profiles(nome,telefone,email),
+
+        profiles:profiles!orders_user_id_profiles_fkey (
+          nome, telefone, email
+        ),
+
         order_items(
           id,product_id,quantidade,preco_unit,subtotal,
           products(nome,image_url)
@@ -314,7 +338,7 @@ export default function AdminEntregasPage() {
         })
         .join(" | ");
 
-      const addr = `${o.rua}, ${o.numero}${o.complemento ? ` - ${o.complemento}` : ""} - ${o.cidade} - CEP ${o.cep}`;
+      const addr = fullAddress(o);
 
       return {
         pedido_id: o.id,
@@ -323,10 +347,17 @@ export default function AdminEntregasPage() {
         dia: DIAS[o.dia_semana] || o.dia_semana,
         cidade: o.cidade,
         endereco: addr,
+        cep: o.cep,
+        rua: o.rua,
+        numero: o.numero,
+        complemento: o.complemento,
+        maps: mapsLink(o),
+
         total: o.total,
         frete: o.frete,
         criado_em: fmtDate(o.created_at),
         entregue_em: fmtDate(o.delivered_at),
+
         cliente_nome: o.profiles?.nome || "",
         cliente_telefone: o.profiles?.telefone || "",
         cliente_email: o.profiles?.email || "",
@@ -347,7 +378,9 @@ export default function AdminEntregasPage() {
         <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Entregas</h1>
-            <p className="mt-1 text-sm text-zinc-400">Agora com contato do cliente (nome/telefone/email) + export CSV.</p>
+            <p className="mt-1 text-sm text-zinc-400">
+              Detalhes do pedido com <b>nome / telefone / e-mail</b>, endereço completo + links rápidos.
+            </p>
 
             <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-6">
               <div className="rounded-2xl border border-white/10 bg-zinc-950/20 p-3">
@@ -505,8 +538,7 @@ export default function AdminEntregasPage() {
                 </div>
 
                 <div className="text-sm text-zinc-300">
-                  Total cidade:{" "}
-                  <b>{formatBRL(g.orders.reduce((acc, o) => acc + Number(o.total || 0), 0))}</b>
+                  Total cidade: <b>{formatBRL(g.orders.reduce((acc, o) => acc + Number(o.total || 0), 0))}</b>
                 </div>
               </div>
 
@@ -635,9 +667,31 @@ export default function AdminEntregasPage() {
                       💬 WhatsApp
                     </a>
 
+                    <a
+                      href={telLink(selected.profiles?.telefone || "")}
+                      className={`rounded-2xl px-4 py-3 text-sm font-semibold ${
+                        selected.profiles?.telefone
+                          ? "border border-white/10 bg-zinc-950/30 hover:bg-white/5"
+                          : "pointer-events-none opacity-50 border border-white/10 bg-zinc-950/30"
+                      }`}
+                    >
+                      📞 Ligar
+                    </a>
+
+                    <a
+                      href={mailLink(selected.profiles?.email || "", `Pedido ${selected.id} - Pamonha`)}
+                      className={`rounded-2xl px-4 py-3 text-sm font-semibold ${
+                        selected.profiles?.email
+                          ? "border border-white/10 bg-zinc-950/30 hover:bg-white/5"
+                          : "pointer-events-none opacity-50 border border-white/10 bg-zinc-950/30"
+                      }`}
+                    >
+                      ✉️ Email
+                    </a>
+
                     <button
                       onClick={() => {
-                        const addr = `${selected.rua}, ${selected.numero}${selected.complemento ? ` - ${selected.complemento}` : ""}, ${selected.cidade} - CEP ${selected.cep}`;
+                        const addr = fullAddress(selected);
                         navigator.clipboard.writeText(addr);
                         setMsg({ type: "ok", text: "Endereço copiado ✅" });
                       }}
@@ -645,6 +699,15 @@ export default function AdminEntregasPage() {
                     >
                       📍 Copiar endereço
                     </button>
+
+                    <a
+                      href={mapsLink(selected)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="rounded-2xl border border-white/10 bg-zinc-950/30 px-4 py-3 text-sm font-semibold hover:bg-white/5"
+                    >
+                      🗺️ Abrir no Maps
+                    </a>
                   </div>
                 </div>
 
@@ -735,7 +798,7 @@ export default function AdminEntregasPage() {
             </div>
 
             <div className="border-t border-white/10 p-6 text-xs text-zinc-500">
-              Exportação: use “Exportar CSV” para levar o roteiro completo com contato e itens.
+              Exportação: “Exportar CSV” inclui endereço completo + link do Maps + contato do cliente.
             </div>
           </div>
         </div>

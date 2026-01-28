@@ -7,27 +7,37 @@ type PaymentStatus = "PENDENTE" | "PAGO" | "CANCELADO";
 type DeliveryStatus = "NOVO" | "EM_ROTA" | "ENTREGUE" | "FALHOU";
 
 type ProductMini = { nome: string; image_url: string | null };
-
-// ✅ aqui é o ponto: pode vir objeto OU array (dependendo do relacionamento no Supabase)
 type ProductMaybeArray = ProductMini | ProductMini[] | null;
+
+type ProfileMini = {
+  nome: string;
+  telefone: string;
+  email: string;
+} | null;
 
 type OrderRow = {
   id: string;
+  user_id: string;
+
   cidade: string;
   dia_semana: number;
   cep: string;
   rua: string;
   numero: string;
   complemento: string;
+
   subtotal: number;
   frete: number;
   total: number;
+
   status: PaymentStatus;
   created_at: string;
 
   delivery_status: DeliveryStatus;
   delivery_notes: string;
   delivered_at: string | null;
+
+  profiles?: ProfileMini;
 
   order_items?: Array<{
     id: number;
@@ -55,17 +65,16 @@ function fmtDate(d: string | null | undefined) {
 }
 
 function todayDiaSemanaBR(): number {
-  // JS: 0 domingo..6 sábado -> queremos 1..7 (seg..dom)
-  const js = new Date().getDay(); // 0..6
+  const js = new Date().getDay(); // 0..6 (dom..sab)
   if (js === 0) return 7;
-  return js; // 1..6 ok
+  return js;
 }
 
 function badgeDelivery(ds: DeliveryStatus) {
   if (ds === "ENTREGUE") return "border-emerald-500/20 bg-emerald-500/10 text-emerald-200";
   if (ds === "EM_ROTA") return "border-sky-500/20 bg-sky-500/10 text-sky-200";
   if (ds === "FALHOU") return "border-rose-500/20 bg-rose-500/10 text-rose-200";
-  return "border-amber-500/20 bg-amber-500/10 text-amber-200"; // NOVO
+  return "border-amber-500/20 bg-amber-500/10 text-amber-200";
 }
 
 function badgePay(ps: PaymentStatus) {
@@ -74,11 +83,50 @@ function badgePay(ps: PaymentStatus) {
   return "border-zinc-500/20 bg-zinc-500/10 text-zinc-200";
 }
 
-// ✅ normaliza product (se vier array, pega o primeiro)
 function firstProduct(p: ProductMaybeArray): ProductMini | null {
   if (!p) return null;
   if (Array.isArray(p)) return p[0] ?? null;
   return p;
+}
+
+function onlyDigits(s: string) {
+  return String(s || "").replace(/\D/g, "");
+}
+
+function waLink(phone: string, text: string) {
+  const d = onlyDigits(phone);
+  if (!d) return "";
+  const cc = d.startsWith("55") ? d : `55${d}`;
+  return `https://wa.me/${cc}?text=${encodeURIComponent(text)}`;
+}
+
+function downloadCSV(filename: string, rows: Record<string, any>[]) {
+  const headers = Array.from(
+    rows.reduce((s, r) => {
+      Object.keys(r).forEach((k) => s.add(k));
+      return s;
+    }, new Set<string>())
+  );
+
+  const esc = (v: any) => {
+    const s = v === null || v === undefined ? "" : String(v);
+    const needs = /[;"\n]/.test(s);
+    const safe = s.replace(/"/g, '""');
+    return needs ? `"${safe}"` : safe;
+  };
+
+  const csv = [headers.join(";"), ...rows.map((r) => headers.map((h) => esc(r[h])).join(";"))].join("\n");
+
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 export default function AdminEntregasPage() {
@@ -112,9 +160,10 @@ export default function AdminEntregasPage() {
       .from("orders")
       .select(
         `
-        id,cidade,dia_semana,cep,rua,numero,complemento,
+        id,user_id,cidade,dia_semana,cep,rua,numero,complemento,
         subtotal,frete,total,status,created_at,
         delivery_status,delivery_notes,delivered_at,
+        profiles(nome,telefone,email),
         order_items(
           id,product_id,quantidade,preco_unit,subtotal,
           products(nome,image_url)
@@ -131,7 +180,6 @@ export default function AdminEntregasPage() {
       return;
     }
 
-    // ✅ aqui resolve o erro do build: converte via unknown
     setOrders((data || []) as unknown as OrderRow[]);
     setLoading(false);
   }
@@ -147,6 +195,7 @@ export default function AdminEntregasPage() {
 
   const filtered = useMemo(() => {
     const term = q.trim().toLowerCase();
+    const termDigits = onlyDigits(term);
 
     return orders.filter((o) => {
       if (dia && Number(o.dia_semana) !== Number(dia)) return false;
@@ -155,11 +204,20 @@ export default function AdminEntregasPage() {
       if (cidade !== "ALL" && (o.cidade || "") !== cidade) return false;
 
       if (term) {
-        const inId = (o.id || "").toLowerCase().includes(term);
-        const inRua = (o.rua || "").toLowerCase().includes(term);
-        const inCep = (o.cep || "").toLowerCase().includes(term);
-        const inNumero = (o.numero || "").toLowerCase().includes(term);
-        if (!inId && !inRua && !inCep && !inNumero) return false;
+        const inId = String(o.id || "").toLowerCase().includes(term);
+        const inRua = String(o.rua || "").toLowerCase().includes(term);
+        const inCep = String(o.cep || "").toLowerCase().includes(term);
+        const inNumero = String(o.numero || "").toLowerCase().includes(term);
+
+        const nome = String(o.profiles?.nome || "").toLowerCase();
+        const email = String(o.profiles?.email || "").toLowerCase();
+        const telDigits = onlyDigits(o.profiles?.telefone || "");
+
+        const inNome = nome.includes(term);
+        const inEmail = email.includes(term);
+        const inTel = termDigits ? telDigits.includes(termDigits) : false;
+
+        if (!inId && !inRua && !inCep && !inNumero && !inNome && !inEmail && !inTel) return false;
       }
       return true;
     });
@@ -229,24 +287,14 @@ export default function AdminEntregasPage() {
       setOrders((prev) =>
         prev.map((o) =>
           o.id === orderId
-            ? {
-                ...o,
-                delivery_status: next,
-                delivery_notes: payload.delivery_notes,
-                delivered_at: payload.delivered_at,
-              }
+            ? { ...o, delivery_status: next, delivery_notes: payload.delivery_notes, delivered_at: payload.delivered_at }
             : o
         )
       );
 
       setSelected((cur) =>
         cur && cur.id === orderId
-          ? {
-              ...cur,
-              delivery_status: next,
-              delivery_notes: payload.delivery_notes,
-              delivered_at: payload.delivered_at,
-            }
+          ? { ...cur, delivery_status: next, delivery_notes: payload.delivery_notes, delivered_at: payload.delivered_at }
           : cur
       );
     } catch (e: any) {
@@ -256,20 +304,50 @@ export default function AdminEntregasPage() {
     }
   }
 
+  function exportCSV() {
+    const rows = filtered.map((o) => {
+      const itemsTxt = (o.order_items || [])
+        .map((it) => {
+          const p = firstProduct(it.products ?? null);
+          const nm = p?.nome || `Produto #${it.product_id}`;
+          return `${it.quantidade}x ${nm}`;
+        })
+        .join(" | ");
+
+      const addr = `${o.rua}, ${o.numero}${o.complemento ? ` - ${o.complemento}` : ""} - ${o.cidade} - CEP ${o.cep}`;
+
+      return {
+        pedido_id: o.id,
+        pagamento: o.status,
+        entrega: o.delivery_status,
+        dia: DIAS[o.dia_semana] || o.dia_semana,
+        cidade: o.cidade,
+        endereco: addr,
+        total: o.total,
+        frete: o.frete,
+        criado_em: fmtDate(o.created_at),
+        entregue_em: fmtDate(o.delivered_at),
+        cliente_nome: o.profiles?.nome || "",
+        cliente_telefone: o.profiles?.telefone || "",
+        cliente_email: o.profiles?.email || "",
+        itens: itemsTxt,
+      };
+    });
+
+    downloadCSV(`entregas_${new Date().toISOString().slice(0, 10)}.csv`, rows);
+  }
+
   function printRoteiro() {
     window.print();
   }
 
   return (
     <div className="space-y-5">
-      {/* topo */}
       <div className="rounded-3xl border border-white/10 bg-white/5 p-6 print:hidden">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Entregas</h1>
-            <p className="mt-1 text-sm text-zinc-400">
-              Operação do dia: filtra, organiza por cidade e marca status da entrega.
-            </p>
+            <p className="mt-1 text-sm text-zinc-400">Agora com contato do cliente (nome/telefone/email) + export CSV.</p>
 
             <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-6">
               <div className="rounded-2xl border border-white/10 bg-zinc-950/20 p-3">
@@ -281,7 +359,7 @@ export default function AdminEntregasPage() {
                 <div className="text-lg font-semibold">{totals.count}</div>
               </div>
               <div className="rounded-2xl border border-white/10 bg-zinc-950/20 p-3">
-                <div className="text-xs text-zinc-400">Total (R$)</div>
+                <div className="text-xs text-zinc-400">Total</div>
                 <div className="text-lg font-semibold">{formatBRL(totals.total)}</div>
               </div>
 
@@ -305,6 +383,12 @@ export default function AdminEntregasPage() {
                 🖨️ Imprimir
               </button>
               <button
+                onClick={exportCSV}
+                className="sm:col-span-2 rounded-2xl border border-white/10 bg-zinc-950/20 px-4 py-3 text-sm font-semibold hover:bg-white/5"
+              >
+                ⬇️ Exportar CSV
+              </button>
+              <button
                 onClick={loadOrders}
                 className="sm:col-span-2 rounded-2xl border border-white/10 bg-zinc-950/20 px-4 py-3 text-sm font-semibold hover:bg-white/5"
               >
@@ -313,10 +397,9 @@ export default function AdminEntregasPage() {
             </div>
           </div>
 
-          {/* filtros */}
           <div className="grid w-full gap-2 sm:grid-cols-4 lg:w-[760px]">
             <div>
-              <label className="text-xs text-zinc-400">Dia (entrega)</label>
+              <label className="text-xs text-zinc-400">Dia</label>
               <select
                 value={dia}
                 onChange={(e) => setDia(Number(e.target.value))}
@@ -376,27 +459,13 @@ export default function AdminEntregasPage() {
             </div>
 
             <div className="sm:col-span-4">
-              <label className="text-xs text-zinc-400">Buscar (rua/cep/id/número)</label>
+              <label className="text-xs text-zinc-400">Buscar (id/rua/cep/número/nome/tel/email)</label>
               <input
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="Ex: Rua / CEP / parte do ID / número"
+                placeholder="Ex: 1199... / gmail / rua / cep"
                 className="mt-2 w-full rounded-2xl border border-white/10 bg-zinc-950/40 px-4 py-3 text-sm outline-none placeholder:text-zinc-500 focus:border-white/20"
               />
-            </div>
-
-            <div className="sm:col-span-4 flex flex-wrap gap-2 pt-1">
-              <button
-                onClick={() => {
-                  setCidade("ALL");
-                  setPayStatus("PENDENTE");
-                  setDeliveryStatus("ALL");
-                  setQ("");
-                }}
-                className="rounded-2xl border border-white/10 bg-zinc-950/20 px-4 py-3 text-sm font-semibold hover:bg-white/5"
-              >
-                Limpar
-              </button>
             </div>
           </div>
         </div>
@@ -414,16 +483,6 @@ export default function AdminEntregasPage() {
         )}
       </div>
 
-      {/* print header */}
-      <div className="hidden print:block">
-        <div className="mb-3 text-lg font-semibold">Entregas — {DIAS[dia]}</div>
-        <div className="mb-4 text-sm">
-          Pedidos: <b>{totals.count}</b> • Total: <b>{formatBRL(totals.total)}</b> • Gerado em:{" "}
-          <b>{new Date().toLocaleString("pt-BR")}</b>
-        </div>
-      </div>
-
-      {/* list */}
       {loading ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           {Array.from({ length: 6 }).map((_, i) => (
@@ -462,6 +521,12 @@ export default function AdminEntregasPage() {
                       <div className="min-w-0">
                         <div className="text-xs text-zinc-400">Pedido</div>
                         <div className="mt-1 truncate text-sm font-semibold">{o.id}</div>
+
+                        <div className="mt-2 text-xs text-zinc-400">Cliente</div>
+                        <div className="mt-1 truncate text-sm font-semibold">{o.profiles?.nome || "—"}</div>
+                        <div className="mt-1 text-xs text-zinc-400">
+                          {o.profiles?.telefone || "—"} {o.profiles?.email ? `• ${o.profiles.email}` : ""}
+                        </div>
                       </div>
 
                       <div className="flex flex-col items-end gap-2">
@@ -479,9 +544,7 @@ export default function AdminEntregasPage() {
                       <div className="mt-1 text-sm font-semibold text-zinc-100">
                         {o.rua}, {o.numero}
                       </div>
-                      {o.complemento ? (
-                        <div className="mt-1 text-sm text-zinc-300">{o.complemento}</div>
-                      ) : null}
+                      {o.complemento ? <div className="mt-1 text-sm text-zinc-300">{o.complemento}</div> : null}
                       <div className="mt-2 text-xs text-zinc-400">CEP: {o.cep}</div>
                     </div>
 
@@ -497,12 +560,7 @@ export default function AdminEntregasPage() {
                     </div>
 
                     <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-zinc-400">
-                      Clique para abrir e marcar entrega
-                    </div>
-
-                    <div className="mt-4 hidden print:block">
-                      <div className="h-10 rounded border border-zinc-300" />
-                      <div className="mt-1 text-xs text-zinc-600">Assinatura / confirmação</div>
+                      Clique para ver detalhes + contato
                     </div>
                   </button>
                 ))}
@@ -512,81 +570,106 @@ export default function AdminEntregasPage() {
         </div>
       )}
 
-      {/* modal */}
       {open && selected && (
         <div className="fixed inset-0 z-[999] flex items-center justify-center p-4">
           <button className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={closeDetails} aria-label="Fechar" />
-
-          <div className="relative w-full max-w-3xl rounded-3xl border border-white/10 bg-zinc-950 text-zinc-100 shadow-2xl">
+          <div className="relative w-full max-w-4xl rounded-3xl border border-white/10 bg-zinc-950 text-zinc-100 shadow-2xl">
             <div className="flex items-start justify-between gap-4 border-b border-white/10 p-6">
               <div className="min-w-0">
-                <div className="text-xs text-zinc-400">Entrega • Pedido</div>
+                <div className="text-xs text-zinc-400">Pedido</div>
                 <div className="mt-1 truncate text-sm font-semibold">{selected.id}</div>
                 <div className="mt-2 text-sm text-zinc-300">
                   {DIAS[selected.dia_semana]} • {selected.cidade}
                 </div>
               </div>
-
-              <div className="flex items-center gap-2">
-                <div className={`rounded-2xl border px-3 py-2 text-xs font-semibold ${badgePay(selected.status)}`}>
-                  {selected.status}
-                </div>
-                <div className={`rounded-2xl border px-3 py-2 text-xs font-semibold ${badgeDelivery(selected.delivery_status)}`}>
-                  {selected.delivery_status}
-                </div>
-                <button
-                  onClick={closeDetails}
-                  className="rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-sm font-semibold hover:bg-white/10"
-                >
-                  Fechar
-                </button>
-              </div>
+              <button
+                onClick={closeDetails}
+                className="rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-sm font-semibold hover:bg-white/10"
+              >
+                Fechar
+              </button>
             </div>
 
-            <div className="grid grid-cols-1 gap-6 p-6 lg:grid-cols-[1fr_320px]">
-              {/* itens */}
+            <div className="grid grid-cols-1 gap-6 p-6 lg:grid-cols-[1fr_360px]">
               <div>
-                <h3 className="text-lg font-semibold">Itens</h3>
-                <p className="mt-1 text-sm text-zinc-400">Produtos e quantidades.</p>
+                <h3 className="text-lg font-semibold">Cliente</h3>
 
-                <div className="mt-4 space-y-3">
-                  {(selected.order_items || []).length === 0 ? (
-                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-zinc-300">
-                      Nenhum item encontrado nesse pedido.
+                <div className="mt-3 rounded-3xl border border-white/10 bg-white/5 p-5">
+                  <div className="text-xs text-zinc-400">Nome</div>
+                  <div className="mt-1 text-lg font-semibold">{selected.profiles?.nome || "—"}</div>
+
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                    <div className="rounded-2xl border border-white/10 bg-zinc-950/20 p-3">
+                      <div className="text-xs text-zinc-400">Telefone</div>
+                      <div className="mt-1 font-semibold">{selected.profiles?.telefone || "—"}</div>
                     </div>
-                  ) : (
-                    selected.order_items?.map((it) => {
-                      const p = firstProduct(it.products ?? null);
-                      const img = p?.image_url || "https://placehold.co/480x320?text=Produto";
-                      const name = p?.nome || `Produto #${it.product_id}`;
+                    <div className="rounded-2xl border border-white/10 bg-zinc-950/20 p-3">
+                      <div className="text-xs text-zinc-400">Email</div>
+                      <div className="mt-1 font-semibold">{selected.profiles?.email || "—"}</div>
+                    </div>
+                  </div>
 
-                      return (
-                        <div key={it.id} className="flex items-center gap-4 rounded-2xl border border-white/10 bg-white/5 p-4">
-                          <div className="h-12 w-16 shrink-0 overflow-hidden rounded-xl border border-white/10 bg-zinc-950/40">
-                            {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img
-                              src={img}
-                              alt={name}
-                              className="h-full w-full object-cover"
-                              loading="lazy"
-                            />
-                          </div>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      onClick={() => {
+                        const tel = selected.profiles?.telefone || "";
+                        if (!tel) return;
+                        navigator.clipboard.writeText(tel);
+                        setMsg({ type: "ok", text: "Telefone copiado ✅" });
+                      }}
+                      className="rounded-2xl border border-white/10 bg-zinc-950/30 px-4 py-3 text-sm font-semibold hover:bg-white/5"
+                    >
+                      📋 Copiar telefone
+                    </button>
 
-                          <div className="min-w-0 flex-1">
-                            <div className="truncate text-sm font-semibold">{name}</div>
+                    <a
+                      href={waLink(selected.profiles?.telefone || "", `Olá! Sobre seu pedido ${selected.id}.`)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className={`rounded-2xl px-4 py-3 text-sm font-semibold ${
+                        selected.profiles?.telefone
+                          ? "border border-emerald-500/20 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/15"
+                          : "pointer-events-none opacity-50 border border-white/10 bg-zinc-950/30"
+                      }`}
+                    >
+                      💬 WhatsApp
+                    </a>
+
+                    <button
+                      onClick={() => {
+                        const addr = `${selected.rua}, ${selected.numero}${selected.complemento ? ` - ${selected.complemento}` : ""}, ${selected.cidade} - CEP ${selected.cep}`;
+                        navigator.clipboard.writeText(addr);
+                        setMsg({ type: "ok", text: "Endereço copiado ✅" });
+                      }}
+                      className="rounded-2xl border border-white/10 bg-zinc-950/30 px-4 py-3 text-sm font-semibold hover:bg-white/5"
+                    >
+                      📍 Copiar endereço
+                    </button>
+                  </div>
+                </div>
+
+                <h3 className="mt-6 text-lg font-semibold">Itens</h3>
+                <div className="mt-3 space-y-3">
+                  {(selected.order_items || []).map((it) => {
+                    const p = firstProduct(it.products ?? null);
+                    const nm = p?.nome || `Produto #${it.product_id}`;
+                    return (
+                      <div key={it.id} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="truncate text-sm font-semibold">{nm}</div>
                             <div className="mt-1 text-xs text-zinc-400">
                               {it.quantidade}x • {formatBRL(Number(it.preco_unit))}
                             </div>
                           </div>
-
                           <div className="text-right">
                             <div className="text-xs text-zinc-400">Subtotal</div>
                             <div className="text-sm font-semibold">{formatBRL(Number(it.subtotal))}</div>
                           </div>
                         </div>
-                      );
-                    })
-                  )}
+                      </div>
+                    );
+                  })}
                 </div>
 
                 <div className="mt-5">
@@ -594,13 +677,11 @@ export default function AdminEntregasPage() {
                   <textarea
                     value={notes}
                     onChange={(e) => setNotes(e.target.value)}
-                    placeholder="Ex: cliente pediu para chamar no portão / sem troco / etc..."
-                    className="mt-2 h-28 w-full resize-none rounded-2xl border border-white/10 bg-zinc-950/40 px-4 py-3 text-sm outline-none placeholder:text-zinc-500 focus:border-white/20"
+                    className="mt-2 h-28 w-full resize-none rounded-2xl border border-white/10 bg-zinc-950/40 px-4 py-3 text-sm outline-none focus:border-white/20"
                   />
                 </div>
               </div>
 
-              {/* resumo/endereço */}
               <div className="h-fit rounded-3xl border border-white/10 bg-white/5 p-5">
                 <h3 className="text-lg font-semibold">Resumo</h3>
 
@@ -617,25 +698,6 @@ export default function AdminEntregasPage() {
                   <div className="flex items-center justify-between">
                     <span className="text-zinc-300">Total</span>
                     <span className="text-lg font-semibold">{formatBRL(Number(selected.total))}</span>
-                  </div>
-                </div>
-
-                <div className="mt-5">
-                  <h4 className="text-sm font-semibold">Endereço</h4>
-                  <div className="mt-2 rounded-2xl border border-white/10 bg-zinc-950/20 p-4 text-sm text-zinc-300">
-                    <div className="font-semibold text-zinc-100">
-                      {selected.rua}, {selected.numero}
-                    </div>
-                    {selected.complemento ? <div className="mt-1">{selected.complemento}</div> : null}
-                    <div className="mt-2 text-xs text-zinc-400">
-                      CEP: {selected.cep} • Cidade: {selected.cidade}
-                    </div>
-                  </div>
-
-                  <div className="mt-3 text-xs text-zinc-500">
-                    Criado: <span className="text-zinc-300">{fmtDate(selected.created_at)}</span>
-                    <br />
-                    Entregue: <span className="text-zinc-300">{fmtDate(selected.delivered_at)}</span>
                   </div>
                 </div>
 
@@ -672,16 +734,8 @@ export default function AdminEntregasPage() {
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/10 p-6">
-              <div className="text-xs text-zinc-500">
-                Pagamento e entrega são separados. Mercado Pago entra depois.
-              </div>
-              <button
-                onClick={closeDetails}
-                className="rounded-2xl bg-white px-4 py-3 text-sm font-semibold text-zinc-900 hover:bg-zinc-200"
-              >
-                Fechar
-              </button>
+            <div className="border-t border-white/10 p-6 text-xs text-zinc-500">
+              Exportação: use “Exportar CSV” para levar o roteiro completo com contato e itens.
             </div>
           </div>
         </div>
@@ -695,9 +749,6 @@ export default function AdminEntregasPage() {
           }
           .print\\:hidden {
             display: none !important;
-          }
-          .print\\:block {
-            display: block !important;
           }
         }
       `}</style>
